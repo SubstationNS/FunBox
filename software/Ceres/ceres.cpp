@@ -11,6 +11,9 @@
 #include "updater.h"
 #include "params.h"
 #include "persist.h"
+#include "latency.h"
+#include "eventlog.h"
+#include <cstdarg>
 
 //
 // Ceres - MIDI-synced dual-track bar looper for the Funbox v3.
@@ -27,6 +30,9 @@
 //   DIP 4: expression learn (on = state A, off = state B: the pedal morphs what differs).
 //   Knobs and the pedal use pickup; MIDI CC (map in the README) jumps. The settings are saved to
 //   QSPI 10 s after the last change and restored at power-up.
+//   Hold footswitch 1 while powering up: latency calibration (cable from Out L to In L).
+//   A black-box log in QSPI records boots, track / MIDI events and a summary every minute
+//   (L over USB serial dumps it, test/log.py).
 //   Dry always passes at unity. Status over USB serial once per bar.
 //
 
@@ -98,6 +104,30 @@ int8_t               grid_switch_last = -1;
 bool                 tempo_restored;
 uint32_t             led_flash_until[2];  // Block counter: takeover / learn flashes
 
+// Round-trip latency (loopback calibration), samples; overdubs and recordings are shifted by it
+volatile float roundtrip_latency;
+
+// Calibration mode: sweeps out, captures in (latency.h). Runs instead of the looper until the
+// next power cycle, outputs muted otherwise (the loopback cable would feed back).
+enum CalibState { CAL_OFF, CAL_SETTLE, CAL_RUN, CAL_GAP, CAL_ANALYZE, CAL_OK, CAL_FAILED };
+static const int  kCalibRuns = 4;
+volatile int      calib_state = CAL_OFF;
+uint32_t          calib_pos;
+int               calib_run;
+float DSY_SDRAM_BSS calib_capture[kCalibRuns][2][ceres::LatencyProbe::kCaptureLength];
+float DSY_SDRAM_BSS calib_sweep[ceres::LatencyProbe::kSweepLength];
+volatile bool     calib_requested;
+volatile uint32_t audio_blocks, calib_done_block;
+
+// Black-box log (eventlog.h) and the numbers for its minute summary
+ceres::EventLog   event_log;
+volatile bool     log_dump_requested;
+volatile float    minute_err_peak_ms;  // MIDI phase error
+volatile uint32_t minute_limit_blocks; // Blocks where the output limiter was working
+float             minute_cpu_peak, minute_cpu_sum;
+uint32_t          minute_cpu_count;
+bool              fs1_held_at_boot;
+
 ceres::Track      tracks[2];
 ceres::Footswitch footswitch[2];
 ceres::DjFilter   filters[2];
@@ -136,6 +166,7 @@ bool              split_mode;
 //             filters flat, FX 0, pedal 0; K releases. X<k><vvv> sets pinned control k (0-4 =
 //             knobs 1, 3, 4, 6, 5; 5 = pedal) to vvv %, e.g. X0050. Y1 / Y0: DIP 4 on / off.
 //   R         restart (tests the saved state). Z: back to defaults (morph cleared, knobs apply)
+//   L         dump the black-box log. C: latency calibration now (like holding footswitch 1 at power-up)
 //   Q         check the QSPI chip, lift a write protection (see updater.h)
 volatile bool  bootloader_requested, daisy_bootloader_requested;
 
@@ -400,6 +431,10 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             reset_requested = true;
         } else if (c == 'Z') {
             defaults_requested = true;
+        } else if (c == 'L') {
+            log_dump_requested = true;
+        } else if (c == 'C') {
+            calib_requested = true;
         } else if (c == 'Q') {
             qspi_probe_requested = true;
         } else if (c == 'T' || c == 'F' || c == 'A' || c == 'M' || c == 'D' || c == 'U' || c == 'I' || c == 'X' || c == 'Y') {
@@ -434,6 +469,7 @@ ceres::Track::Settings ReadTrackSettings()
     if (grid_override > 0)
         st.grid_ticks = (uint32_t)grid_override;
     st.preset_bars = preset_bars;
+    st.latency     = (uint32_t)roundtrip_latency;
     return st;
 }
 
@@ -492,6 +528,11 @@ void HandleFootswitches(double now, const ceres::Track::Settings& st)
     bool    down[2];
     down[0] = hw.switches[Funbox::FOOTSWITCH_1].Pressed() || fs_injected[0];
     down[1] = hw.switches[Funbox::FOOTSWITCH_2].Pressed() || fs_injected[1];
+    if (fs1_held_at_boot) {  // It was the calibration gesture, not a tap
+        if (!down[0])
+            fs1_held_at_boot = false;
+        down[0] = false;
+    }
     for (int t = 0; t < 2; t++)
         ev[t] = footswitch[t].Update(down[t], now);
 
@@ -563,19 +604,82 @@ float TrackLed(const ceres::Track& t, uint32_t blocks)
 }
 
 
+// Calibration: 0.7 s quiet, then 4 runs of sweep out / capture in, 0.15 s apart. The capture
+// starts on the sample the sweep starts on, so the measured delay is the whole round trip.
+void CalibrationAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size, uint32_t blocks)
+{
+    const uint32_t settle = (uint32_t)(0.7f * clock_sample_rate), gap = (uint32_t)(0.15f * clock_sample_rate);
+    for (size_t i = 0; i < size; i++) {
+        float o = 0.0f;
+        switch (calib_state) {
+            case CAL_SETTLE:
+                if (++calib_pos >= settle) {
+                    calib_state = CAL_RUN;
+                    calib_pos   = 0;
+                }
+                break;
+            case CAL_RUN:
+                o = calib_pos < ceres::LatencyProbe::kSweepLength ? calib_sweep[calib_pos] : 0.0f;
+                calib_capture[calib_run][0][calib_pos] = in[0][i];
+                calib_capture[calib_run][1][calib_pos] = in[1][i];
+                if (++calib_pos == ceres::LatencyProbe::kCaptureLength) {
+                    calib_pos = 0;
+                    calib_state = ++calib_run == kCalibRuns ? CAL_ANALYZE : CAL_GAP;
+                }
+                break;
+            case CAL_GAP:
+                if (++calib_pos >= gap) {
+                    calib_state = CAL_RUN;
+                    calib_pos   = 0;
+                }
+                break;
+            default: break;
+        }
+        out[0][i] = out[1][i] = o;
+    }
+    // LEDs: on while measuring; OK = 3 slow blinks then a dim glow; failed = fast blinking
+    float l = 0.6f;
+    if (calib_state == CAL_OK)
+        l = (blocks - calib_done_block < 3000 && (blocks - calib_done_block) % 1000 < 500) ? 1.0f : 0.15f;
+    else if (calib_state == CAL_FAILED)
+        l = (blocks / 100) & 1 ? 1.0f : 0.0f;
+    led1.Set(l);
+    led2.Set(l);
+    led1.Update();
+    led2.Update();
+}
+
+
 static void AudioCallback(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           size_t                    size)
 {
     uint32_t block_time = System::GetTick();
-    static uint32_t blocks;
-    blocks++;
+    uint32_t blocks = ++audio_blocks;
     cpu_meter.OnBlockStart();
+
+    if (calib_state != CAL_OFF) {  // Calibration replaces the looper until the next power cycle
+        CalibrationAudio(in, out, size, blocks);
+        block_sample += size;
+        cpu_meter.OnBlockEnd();
+        return;
+    }
+    if (calib_requested) {
+        calib_requested = false;
+        calib_state     = CAL_SETTLE;
+        calib_pos       = 0;
+        calib_run       = 0;
+    }
 
     hw.ProcessAnalogControls();
     hw.ProcessDigitalControls();
 
     ProcessMidi(block_time);  // Steers the clock before this block runs
+    if (midi_sync.Locked()) {
+        float e = fabsf((float)midi_sync.PhaseErrorTicks()) * 60000.0f / (clock.Tempo() * Clock::kTicksPerBeat);
+        if (e > minute_err_peak_ms)
+            minute_err_peak_ms = e;
+    }
     HandleTransport();
     UpdateTempo(tempo_knob.Process());
 
@@ -690,6 +794,8 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     led2.Set(blocks < led_flash_until[1] ? 1.0f : fmaxf(TrackLed(tracks[1], blocks), learn));
     led1.Update();
     led2.Update();
+    if (limiters[0].GainReduction() < 0.9f || limiters[1].GainReduction() < 0.9f)
+        minute_limit_blocks++;
 
     block_sample += size;
     cpu_meter.OnBlockEnd();
@@ -761,6 +867,9 @@ void PrintStatus()
                       (int)(cpu_meter.GetAvgCpuLoad() * 100.0f), (int)(cpu_meter.GetMaxCpuLoad() * 100.0f),
                       midi_ticks, midi_starts, midi_continues, midi_stops, midi_spp, midi_cc, midi_other,
                       midi_dropped, uart_restarts);
+    minute_cpu_peak = fmaxf(minute_cpu_peak, cpu_meter.GetMaxCpuLoad());
+    minute_cpu_sum += cpu_meter.GetAvgCpuLoad();
+    minute_cpu_count++;
     cpu_meter.Reset();  // Max per bar
 }
 
@@ -793,6 +902,173 @@ class QspiSnapshotFlash : public ceres::SnapshotFlash
 QspiSnapshotFlash snapshot_flash;
 
 
+// Black-box log: 64 KB just below the snapshot slots
+class QspiLogFlash : public ceres::LogFlash
+{
+  public:
+    static const uint32_t kBase = 0x7FC000 - ceres::EventLog::kSize;
+
+    const uint8_t* Read(uint32_t offset) override
+    {
+        uint8_t* p = (uint8_t*)hw.seed.qspi.GetData(kBase + offset);
+        dsy_dma_invalidate_cache_for_buffer(p, 128);
+        return p;
+    }
+    bool Program(uint32_t offset, const uint8_t* data, uint32_t size) override
+    {
+        return hw.seed.qspi.Write(0x90000000 + kBase + offset, size, (uint8_t*)data) == QSPIHandle::Result::OK;
+    }
+    bool EraseSector(uint32_t offset) override
+    {
+        uint32_t a = 0x90000000 + kBase + offset;
+        return hw.seed.qspi.Erase(a, a + 4096) == QSPIHandle::Result::OK;
+    }
+};
+QspiLogFlash log_flash;
+
+// Main loop only (writes flash). Also printed over USB.
+void Log(const char* fmt, ...)
+{
+    char    text[ceres::EventLog::kTextMax];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    event_log.Append(System::GetNow(), text);
+    hw.seed.PrintLine("log: %s", text);
+}
+
+void DumpLog()
+{
+    log_dump_requested = false;
+    hw.seed.PrintLine("log begin");
+    event_log.ForEach([](const ceres::EventLog::Entry& e) {
+        uint32_t s = e.uptime_ms / 1000;
+        hw.seed.PrintLine("#%lu boot %u +%lu:%02lu:%02lu %s", e.seq, e.boot, s / 3600, (s / 60) % 60, s % 60, e.text);
+        System::Delay(2);  // Don't outrun the USB logger
+    });
+    hw.seed.PrintLine("log end");
+}
+
+static const char* kLogStates[] = {"empty", "armed", "recording", "playing", "overdub", "stopped", "armed-play"};
+
+// Bars as text: "4 bars", "1 bar", "3+48/96"
+static void BarsText(char* out, size_t size, uint32_t ticks)
+{
+    if (ticks % 96 == 0)
+        snprintf(out, size, "%lu bar%s", ticks / 96, ticks == 96 ? "" : "s");
+    else
+        snprintf(out, size, "%lu+%lu/96", ticks / 96, ticks % 96);
+}
+
+// Main loop: turn changes into log entries, plus a summary every minute
+void MonitorAndLog()
+{
+    static uint32_t last_check, last_summary;
+    static ceres::Track::State last_state[2];
+    static bool    last_undo[2], last_redo[2], last_locked;
+    static uint32_t last_starts, last_stops, last_conts, last_uart, last_dropped, last_failures;
+    uint32_t now = System::GetNow();
+    if (now - last_check < 20)
+        return;
+    last_check = now;
+
+    for (int t = 0; t < 2; t++) {
+        ceres::Track::State st = tracks[t].GetState();
+        if (st != last_state[t]) {
+            char bars[20];
+            BarsText(bars, sizeof(bars), tracks[t].LengthTicks());
+            if (last_state[t] == ceres::Track::RECORDING && st == ceres::Track::PLAYING)
+                Log("T%d recorded %s (%lu samples)", t + 1, bars, tracks[t].LengthSamples());
+            else if (st == ceres::Track::STOPPED && tracks[t].PausedByMidi())
+                Log("T%d paused by MIDI Stop", t + 1);
+            else
+                Log("T%d %s -> %s", t + 1, kLogStates[last_state[t]], kLogStates[st]);
+            last_state[t] = st;
+        }
+        bool undo = tracks[t].CanUndo(), redo = tracks[t].CanRedo();
+        if (redo && !last_redo[t])
+            Log("T%d undo", t + 1);
+        else if (undo && last_redo[t] && !redo)
+            Log("T%d redo", t + 1);
+        last_undo[t] = undo;
+        last_redo[t] = redo;
+    }
+
+    bool locked = midi_sync.Locked();
+    if (locked != last_locked) {
+        if (locked)
+            Log("MIDI clock locked, %d.%02d BPM", (int)clock.Tempo(), (int)(clock.Tempo() * 100) % 100);
+        else
+            Log("MIDI clock lost, free-running at %d.%02d BPM", (int)clock.Tempo(), (int)(clock.Tempo() * 100) % 100);
+        last_locked = locked;
+    }
+    if (midi_starts != last_starts)
+        Log("MIDI Start");
+    if (midi_stops != last_stops)
+        Log("MIDI Stop");
+    if (midi_continues != last_conts)
+        Log("MIDI Continue (bar %lu)", clock.Bar() + 1);
+    if (uart_restarts != last_uart)
+        Log("MIDI UART error, restarted (%lu so far)", uart_restarts);
+    if (midi_dropped != last_dropped)
+        Log("MIDI bytes dropped (%lu so far)", midi_dropped);
+    if (save_failures != last_failures)
+        Log("saving settings FAILED (%lu so far)", save_failures);
+    last_starts = midi_starts, last_stops = midi_stops, last_conts = midi_continues;
+    last_uart = uart_restarts, last_dropped = midi_dropped, last_failures = save_failures;
+
+    if (now - last_summary >= 60000) {
+        last_summary = now;
+        float ms_tick = 60000.0f / (clock.Tempo() * Clock::kTicksPerBeat);
+        int   jit     = (int)roundf((float)(midi_sync.JitterSamples() / samples_per_timer_tick) / (float)System::GetTickFreq() * 100000.0f);
+        int   err     = (int)roundf(minute_err_peak_ms * 100.0f);
+        int   cpu_avg = minute_cpu_count ? (int)(minute_cpu_sum / minute_cpu_count * 100.0f) : 0;
+        char  t1[20], t2[20];
+        BarsText(t1, sizeof(t1), tracks[0].LengthTicks());
+        BarsText(t2, sizeof(t2), tracks[1].LengthTicks());
+        Log("1m: cpu %d%% peak %d%% | %d BPM %s err %d.%02d jit %d.%02d ms | lim %lu | T1 %s %s T2 %s %s",
+            cpu_avg, (int)(minute_cpu_peak * 100.0f), (int)roundf(clock.Tempo()),
+            midi_sync.Locked() ? "midi" : "int", err / 100, err % 100, jit / 100, jit % 100, minute_limit_blocks,
+            kLogStates[tracks[0].GetState()], tracks[0].HasLoop() ? t1 : "", kLogStates[tracks[1].GetState()],
+            tracks[1].HasLoop() ? t2 : "");
+        (void)ms_tick;
+        minute_err_peak_ms = 0.0f;
+        minute_limit_blocks = 0;
+        minute_cpu_peak = minute_cpu_sum = 0.0f;
+        minute_cpu_count = 0;
+    }
+}
+
+// Main loop: when the captures are in, measure them
+void FinishCalibration()
+{
+    using ceres::LatencyProbe;
+    LatencyProbe::Result ch[2];
+    for (int c = 0; c < 2; c++) {
+        LatencyProbe::Result runs[kCalibRuns];
+        for (int r = 0; r < kCalibRuns; r++)
+            runs[r] = LatencyProbe::Measure(calib_capture[r][c], calib_sweep);
+        ch[c] = LatencyProbe::Combine(runs, kCalibRuns);
+    }
+    int use = ch[0].ok ? 0 : (ch[1].ok ? 1 : -1);
+    for (int c = 0; c < 2; c++)
+        Log("calibration In %c: %s, %d.%02d samples, match %d%%, level %d%%", c ? 'R' : 'L', ch[c].ok ? "ok" : "no signal",
+            (int)ch[c].delay, (int)(ch[c].delay * 100) % 100, (int)(ch[c].match * 100), (int)(ch[c].level * 100));
+    calib_done_block = audio_blocks;
+    if (use < 0) {
+        Log("calibration FAILED: no loopback (cable from Out L to In L?), latency unchanged");
+        calib_state = CAL_FAILED;
+        return;
+    }
+    roundtrip_latency = ch[use].delay;
+    float ms = ch[use].delay / clock_sample_rate * 1000.0f;
+    Log("calibration OK: round trip %d.%02d samples = %d.%02d ms, saved", (int)ch[use].delay,
+        (int)(ch[use].delay * 100) % 100, (int)ms, (int)(ms * 100) % 100);
+    calib_state = CAL_OK;
+}
+
+
 // What would be saved right now
 ceres::Snapshot CurrentSettings()
 {
@@ -803,6 +1079,7 @@ ceres::Snapshot CurrentSettings()
     snap.tempo          = clock.Tempo();
     snap.delay_division = delay_division;
     snap.preset_bars    = preset_bars;
+    snap.latency        = roundtrip_latency;
     snap.morph          = controls.GetMorph();
     return snap;
 }
@@ -828,19 +1105,45 @@ void SaveWhenSettled()
     if (store.Save(snap)) {
         saved_snap = snap;
         saves++;
-        hw.seed.PrintLine("saved settings (#%lu)", snap.sequence);
+        Log("saved settings #%lu", snap.sequence);
     } else {
         saved_snap = snap;  // Don't retry every 100 ms
         save_failures++;
-        hw.seed.PrintLine("saving settings FAILED");
+        hw.seed.PrintLine("saving settings FAILED");  // Logged by MonitorAndLog
     }
+}
+
+
+#ifndef CERES_VERSION
+#define CERES_VERSION "unknown"
+#endif
+
+// Why the chip (re)started, from the reset flags (cleared afterwards)
+static void ResetCause(char* out, size_t size)
+{
+    uint32_t rsr = RCC->RSR;
+    RCC->RSR |= RCC_RSR_RMVF;
+    snprintf(out, size, "%s%s%s%s%s%s", rsr & RCC_RSR_PORRSTF ? "power-on " : "", rsr & RCC_RSR_BORRSTF ? "brownout " : "",
+             rsr & RCC_RSR_SFTRSTF ? "software " : "", rsr & RCC_RSR_IWDG1RSTF ? "watchdog " : "",
+             rsr & RCC_RSR_WWDG1RSTF ? "window-watchdog " : "",
+             (rsr & RCC_RSR_PINRSTF) && !(rsr & (RCC_RSR_PORRSTF | RCC_RSR_SFTRSTF)) ? "reset-pin " : "");
 }
 
 
 int main(void)
 {
+    char reset_cause[64];
+    ResetCause(reset_cause, sizeof(reset_cause));
+
     hw.Init();
     hw.SetAudioBlockSize(48);
+
+    // Footswitch 1 held while powering up: latency calibration (read before audio starts)
+    for (int i = 0; i < 40; i++) {
+        hw.ProcessDigitalControls();
+        System::Delay(1);
+    }
+    fs1_held_at_boot = hw.switches[Funbox::FOOTSWITCH_1].Pressed();
 
     // USB serial log, doesn't wait for a host to connect
     hw.seed.StartLog(false);
@@ -872,6 +1175,7 @@ int main(void)
         tempo_restored = true;
         delay_division = restored.delay_division <= 4 ? restored.delay_division : 1;
         preset_bars    = restored.preset_bars;
+        roundtrip_latency = restored.latency >= 0.0f && restored.latency < 4800.0f ? restored.latency : 0.0f;
         saved_snap     = restored;
     } else {
         controls.Init(nullptr, nullptr);
@@ -907,6 +1211,11 @@ int main(void)
 
     updater.Init(&hw.seed, update_buf);
 
+    for (uint32_t i = 0; i < ceres::LatencyProbe::kSweepLength; i++)
+        calib_sweep[i] = ceres::LatencyProbe::Sweep(i, sample_rate);
+    if (fs1_held_at_boot)
+        calib_state = CAL_SETTLE;
+
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
 
@@ -920,6 +1229,14 @@ int main(void)
         hw.seed.PrintLine("restored settings #%lu (%d BPM)", restored.sequence, (int)restored.tempo);
     else
         hw.seed.PrintLine("no saved settings, defaults");
+
+    event_log.Init(&log_flash);
+    int lat_x100 = (int)roundf(roundtrip_latency * 100.0f);
+    Log("boot %u: fw %s, %s, %s, latency %d.%02d%s", event_log.Boot(), CERES_VERSION,
+        reset_cause[0] ? reset_cause : "reset", have_snapshot ? "settings restored" : "defaults", lat_x100 / 100,
+        lat_x100 % 100, roundtrip_latency > 0.0f ? "" : " (not calibrated)");
+    if (fs1_held_at_boot)
+        Log("calibration: footswitch 1 held at power-up, measuring (cable Out L -> In L)");
 
     while (1)
     {
@@ -944,6 +1261,18 @@ int main(void)
             qspi_probe_requested = false;
             updater.Unprotect(false);
         }
+
+        if (calib_state == CAL_ANALYZE) {
+            FinishCalibration();
+            if (calib_state == CAL_OK) {  // Save now: the power may be pulled any moment
+                ceres::Snapshot snap = CurrentSettings();
+                if (store.Save(snap))
+                    saved_snap = pending_snap = snap;
+            }
+        }
+        MonitorAndLog();
+        if (log_dump_requested)
+            DumpLog();
 
         if (bar_print_pending) {
             bar_print_pending = false;

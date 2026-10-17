@@ -166,8 +166,10 @@ Overdub is classic: the existing loop is kept at full level, new input is added.
     recording carries on on the free-running clock.
   - Hold 1 s while armed or recording discards the take.
   - Tempo knob is locked while any track has a loop (picks back up once moved after clearing).
-- Still open: input latency compensation (needs a measurement on the FunBox), the MIDI CC map,
-  the LED countdown for power-of-two endings, the "free-running" LED pulse.
+- Latency compensation: a loopback calibration (hold footswitch 1 at power-up, cable Out L -> In L)
+  measures the round trip; overdubs are written that far behind the playhead, first recordings
+  skip half of it (the input side). Saved with the settings.
+- Still open: the LED countdown for power-of-two endings, the "free-running" LED pulse.
 
 ## Signal flow (dual mono)
 

@@ -4,3 +4,5 @@ test/midi_test
 test/track_test
 loader/build/
 test/params_test
+test/latency_test
+test/log_test

@@ -81,6 +81,30 @@ Per footswitch:
 - A knob and the pedal share the parameters they both control by pickup: whichever crosses the
   current value last owns it, so nothing ever jumps.
 
+### Latency calibration (once, with a cable)
+
+Overdubs and recordings are shifted by the pedal's own round trip (out to in), so what you play
+lands where you played it. To measure it:
+
+1. Patch an instrument cable from **Out L to In L**.
+2. **Hold footswitch 1 while plugging in the power**, let go after a second.
+3. Both LEDs light while it measures (about 4 s: four sweeps out, recorded back in).
+4. **3 slow blinks** = measured and saved. **Fast blinking** = failed (no cable? wrong jack?).
+5. It stays muted (the cable would feed back): unplug the power, remove the cable, power up.
+
+The result is in the log (`calibration OK: round trip ... samples`).
+
+### Black-box log
+
+The pedal keeps a log in its flash, so you can see what happened in the enclosure or on a gig,
+without USB connected: every boot (firmware version, why it restarted, settings restored),
+calibration results, track events (recorded / overdub / undo / clear / stop), MIDI events (clock
+locked / lost, Start / Stop / Continue, UART errors), saves, and a summary every minute
+(CPU average and peak, tempo, MIDI phase error and jitter peaks, how often the limiter worked).
+About 500 entries, oldest dropped first.
+
+Afterwards, plug in USB and run `python3 test/log.py` (`--save file.txt` to keep it).
+
 ### MIDI CC (any channel)
 
 | CC | Function | CC | Function |
@@ -132,6 +156,7 @@ Dev commands over USB serial (`tio /dev/ttyACM0`): `T<bpm>` pins the tempo, `F<0
 (tape/delay/repeat), `A<0-100>` the FX amount, `S` toggles a stress test (all three FX in series),
 `K` hands everything back to the controls, `B` reboots into the STM32 ROM bootloader (DFU),
 `W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip.
+`L` dumps the log, `C` runs the latency calibration right away.
 `X<k><vvv>` / `Y1` `Y0` pin knob / pedal readings and DIP 4 (after `N`), `R` restarts, `Z` resets the
 settings to defaults. `test/params_inject.py` tests pickup, the morph, MIDI CC and saving with them. MIDI injection: raw bytes
 0xF8-0xFF (clock, Start, Continue, Stop) and `M<hex>` (e.g. `Mf20001` = Song Position bar 9) go
@@ -172,6 +197,13 @@ Parameters and saved settings (pickup, power-on, MIDI CC, A/B morph, snapshot sl
 cuts and old layouts):
 ```
 c++ -std=c++17 -O2 -I.. params_test.cpp -o params_test && ./params_test
+```
+
+Latency probe (fractional delays through a simulated codec, no-cable detection) and the log
+(order across boots, the ring wrapping, power cuts mid-write):
+```
+c++ -std=c++17 -O2 -I.. latency_test.cpp -o latency_test && ./latency_test
+c++ -std=c++17 -O2 -I.. log_test.cpp -o log_test && ./log_test
 ```
 
 FX demo: renders a plucked riff through each FX (same code as the pedal) to WAV files:

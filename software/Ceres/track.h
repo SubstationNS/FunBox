@@ -15,6 +15,9 @@
 //     crossfaded jump if it's far off), so loops stay locked to MIDI clock for hours. If the
 //     tempo is no longer the recorded one, the loop plays at its own speed and restarts on
 //     every loop boundary of the clock (until the stretcher exists).
+//   - Latency: what you play in comes back a round trip after what you heard went out. Overdubs
+//     are written that far behind the playhead; first recordings skip half of it (the input side)
+//     so the downbeat you played lands on the bar line.
 //   - Seams: the recording runs 5 ms past the end, and that tail is crossfaded into the start,
 //     so the loop wraps without a click. Starts, stops and punch in/out are 5 ms fades.
 //   - Undo: two buffers per track, the playing one and the undo/redo one. An overdub writes in
@@ -56,6 +59,7 @@ class Track
         bool     power_of_two = false;     // Tap ending rounds up to 1, 2, 4, 8, ... bars
         StopMode stop_mode    = STOP_NOW;
         uint32_t preset_bars  = 0;         // Recordings end by themselves after this many bars (0 = off)
+        uint32_t latency      = 0;         // Measured round trip (out -> in), samples (loopback calibration)
     };
 
     static constexpr float  kFadeSeconds   = 0.005f;  // Seams, start/stop, punch in/out
@@ -182,6 +186,8 @@ class Track
         len_            = 0;
         len_ticks_      = 0;
         rec_count_      = 0;
+        rec_written_    = 0;
+        rec_skip_       = 0;
         rec_ticks_      = 0;
         end_ticks_      = 0;
         post_roll_left_ = 0;
@@ -346,8 +352,12 @@ class Track
         }
 
         if (state_ == RECORDING) {
-            buf_[cur_][rec_count_++] = in;
-            if (rec_count_ + fade_len_ + 1 >= capacity_)
+            rec_count_++;  // Time since the bar line
+            if (rec_skip_ > 0)
+                rec_skip_--;  // Still the input latency: this was played before the bar line
+            else
+                buf_[cur_][rec_written_++] = in;
+            if (rec_written_ + fade_len_ + 1 >= capacity_)
                 ForceEnd(clock);
             return 0.0f;
         }
@@ -356,7 +366,7 @@ class Track
 
         // Recording the tail past the end, for the seam crossfade
         if (post_roll_left_ > 0) {
-            buf_[cur_][rec_count_++] = in;
+            buf_[cur_][rec_written_++] = in;
             if (--post_roll_left_ == 0)
                 BakeSeam();
         }
@@ -487,6 +497,8 @@ class Track
         state_     = RECORDING;
         cur_       = 0;
         rec_count_ = 0;
+        rec_written_ = 0;
+        rec_skip_  = settings_.latency / 2;
         rec_ticks_ = 0;
         end_ticks_ = 0;
         anchor_    = (int64_t)clock.Tick();
@@ -548,8 +560,9 @@ class Track
         follow_         = true;
         last_idx_valid_ = false;
         env_            = 0.0f;
-        uint32_t past   = rec_count_ - samples;
-        post_roll_left_ = past < fade_len_ ? fade_len_ - past : 0;
+        // Recording carries on until the tail past the end is in (input latency later than the clock)
+        uint32_t want   = samples + fade_len_;
+        post_roll_left_ = rec_written_ < want ? want - rec_written_ : 0;
         if (post_roll_left_ == 0)
             BakeSeam();
     }
@@ -575,8 +588,10 @@ class Track
 
     uint32_t WriteIndex() const
     {
-        uint32_t i = (uint32_t)p_ % len_;
-        return i >= kWriteBehind ? i - kWriteBehind : i + len_ - kWriteBehind;
+        uint32_t latency = settings_.latency < len_ / 2 ? settings_.latency : len_ / 2;
+        uint32_t behind  = kWriteBehind + latency;  // What you hear went out a round trip ago
+        uint32_t i       = (uint32_t)p_ % len_;
+        return i >= behind ? i - behind : i + len_ - behind;
     }
 
     uint32_t NextWriteIndex() const
@@ -767,6 +782,7 @@ class Track
 
     // Recording
     uint32_t rec_count_, rec_ticks_, end_ticks_, post_roll_left_;
+    uint32_t rec_written_, rec_skip_;  // Samples in the buffer; input latency still to skip
 
     // Loop and playback
     uint32_t len_, len_ticks_;

@@ -25,7 +25,7 @@ namespace ceres
 struct Snapshot
 {
     static const uint32_t kMagic   = 0x31535243;  // "CRS1"
-    static const uint16_t kVersion = 1;
+    static const uint16_t kVersion = 2;  // 2: + latency
 
     uint32_t magic;
     uint16_t version;
@@ -37,6 +37,7 @@ struct Snapshot
     uint8_t delay_division;  // MIDI CC 77
     uint8_t preset_bars;     // MIDI CC 29: recordings end after this many bars (0 = off)
     uint8_t reserved[2];
+    float   latency;         // Measured round trip, samples (0 = not measured)
     Controls::Morph morph;
 
     uint32_t crc;  // Over everything above
@@ -47,7 +48,8 @@ struct Snapshot
         for (int i = 0; i < Controls::kCount; i++)
             if (std::fabs(values[i] - o.values[i]) > tolerance)
                 return false;
-        if (std::fabs(tempo - o.tempo) > 0.05f || delay_division != o.delay_division || preset_bars != o.preset_bars)
+        if (std::fabs(tempo - o.tempo) > 0.05f || delay_division != o.delay_division || preset_bars != o.preset_bars
+            || latency != o.latency)
             return false;
         if (morph.valid != o.morph.valid || morph.mask != o.morph.mask)
             return false;

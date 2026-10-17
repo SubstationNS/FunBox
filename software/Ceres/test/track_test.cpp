@@ -502,6 +502,40 @@ static void TestLongOverdub()
     delete &r;
 }
 
+// With a 200-sample round trip: the first take starts 100 samples (the input half) after the
+// bar line, overdubs land 200 (+2) behind the playhead
+static void TestLatency()
+{
+    std::printf("track: latency compensation\n");
+    const uint32_t kRt = 200;
+    Rig r;
+    r.settings.latency = kRt;
+    r.Block();  // Settings reach the track
+    r.Record(SineA, 1.5);
+    r.RunToBar(2.2);
+    r.input = [](double) { return 0.0; };
+    double e1 = CheckModel(r, 2.0, [&](uint64_t, double q) { return SineA((double)r.rec_start + kRt / 2 + q); });
+    CHECK(e1 < 0.01, "first take shifted by the input half: error %.4f", e1);
+
+    r.RunToBar(4.0);
+    r.input = SineB;
+    r.track.Tap(r.clock);
+    uint64_t dub_start = r.n;
+    r.RunToBar(4.6);
+    r.track.Tap(r.clock);
+    uint64_t dub_end = r.n;
+    r.input = [](double) { return 0.0; };
+    double q0 = r.pos[dub_start];
+    uint32_t L = r.track.LengthSamples();
+    double e2 = CheckModel(r, 2.0, [&](uint64_t, double q) {
+        double d = std::fmod(q + kBehind + kRt - q0 + L, (double)L);
+        double b = d < (double)(dub_end - dub_start) - 300 && d > 300 ? SineB((double)dub_start + d) : 0.0;
+        return SineA((double)r.rec_start + kRt / 2 + q) + b;
+    });
+    CHECK(e2 < 0.02, "overdub a round trip behind the playhead: error %.4f", e2);
+    std::printf("  round trip %u: first take %.4f, overdub %.4f (rms error vs. expected)\n", kRt, e1, e2);
+}
+
 static void TestStopModes()
 {
     std::printf("track: stop modes\n");
@@ -644,6 +678,7 @@ int main()
     TestDoubleTapCancel();
     TestBackToBackOverdubs();
     TestLongOverdub();
+    TestLatency();
     TestStopModes();
     TestFollowsClock();
     TestOtherTempo();

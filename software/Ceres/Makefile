@@ -21,3 +21,6 @@ include $(SYSTEM_FILES_DIR)/Makefile
 
 # Include funbox.h
 C_INCLUDES += -I../../include
+
+# Firmware version for the log: the git commit (build dates are pinned to 1980 in nix builds)
+C_DEFS += -DCERES_VERSION=\"$(shell git describe --always --dirty 2>/dev/null || echo unknown)\"
