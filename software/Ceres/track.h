@@ -1,5 +1,6 @@
 #pragma once
 #include "clock.h"
+#include "stretch.h"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,8 +14,12 @@
 //   - Length is kept in clock ticks and samples. Playback follows the clock: the position is
 //     pulled toward where the clock says the loop should be (rate nudges up to +-0.2 %, a
 //     crossfaded jump if it's far off), so loops stay locked to MIDI clock for hours. If the
-//     tempo is no longer the recorded one, the loop plays at its own speed and restarts on
-//     every loop boundary of the clock (until the stretcher exists).
+//     tempo is more than 0.6 % off the recorded one, the loop is time-stretched instead
+//     (stretch.h, pitch unchanged), still following the clock.
+//   - Overdubbing a stretched loop: the overdub is held aside while the loop is re-rendered at
+//     the current tempo into the undo buffer (in the main loop, after the cancel window), then
+//     playback crossfades to the new loop and the held overdub is written into it. Undo brings
+//     back the original recording, at its own tempo.
 //   - Latency: what you play in comes back a round trip after what you heard went out. Overdubs
 //     are written that far behind the playhead; first recordings skip half of it (the input side)
 //     so the downbeat you played lands on the bar line.
@@ -74,9 +79,13 @@ class Track
 
     // a, b: loop and undo buffers, `capacity` samples each. side_a, side_b: `side_size` samples
     // each, at least kCancelSeconds (two, so a new overdub can start while the last one is being committed)
+    // hold: `hold_size` samples, where an overdub on a stretched loop waits for the re-render
     void Init(float sample_rate, float* a, float* b, uint32_t capacity, float* side_a, float* side_b,
-              uint32_t side_size)
+              uint32_t side_size, float* hold, uint32_t hold_size)
     {
+        hold_buf_    = hold;
+        hold_size_   = hold_size;
+        stagger_     = 0;
         sr_          = sample_rate;
         buf_[0]      = a;
         buf_[1]      = b;
@@ -111,7 +120,7 @@ class Track
                 if (stop_pending_) {
                     stop_pending_ = false;  // Changed your mind: keep playing
                 } else {
-                    StartDub();
+                    StartDub(clock);
                     press_started_session_ = true;
                 }
                 break;
@@ -151,7 +160,18 @@ class Track
             Clear();
             return;
         }
-        RevertPress();
+        if (render_ != R_NONE) {
+            // A stretched overdub is waiting / rendering. If this press just started it, take it
+            // back and undo the layer before; otherwise it is the overdub being undone.
+            bool this_press = press_started_session_ && render_ == R_HOLD;
+            RevertPress();
+            if (render_ != R_NONE)
+                AbortStretchedDub();
+            if (!this_press)
+                return;
+        } else {
+            RevertPress();
+        }
         if (state_ == EMPTY)
             return;
         if (job_ == COPY_UNDO)
@@ -207,6 +227,14 @@ class Track
         undo_pending_   = false;
         stop_pending_   = false;
         paused_by_midi_ = false;
+        alt_len_        = 0;
+        stretching_     = false;
+        mode_xf_left_   = 0;
+        swap_pending_   = false;
+        if (render_ != R_NONE)
+            render_gen_++;  // A render in the main loop stops
+        render_         = R_NONE;
+        hold_count_     = 0;
         before_press_   = EMPTY;
         press_started_session_ = press_ended_recording_ = false;
     }
@@ -268,6 +296,7 @@ class Track
             state_          = PLAYING;
             p_              = Expected(clock);  // Silent until now, no crossfade needed
             last_idx_valid_ = false;
+            stretching_     = false;  // Re-decided (and the stretcher reset) next block
         }
     }
 
@@ -285,30 +314,67 @@ class Track
         if (side_phase_ && side_elapsed_ >= (uint32_t)(kCancelSeconds * sr_))
             Commit(NextWriteIndex());  // Too late to cancel now
 
+        // A stretched overdub: render once the cancel window is over (and no copy is using the
+        // undo buffer); switch over once the main loop has rendered
+        if (render_ == R_HOLD && hold_elapsed_ >= (uint32_t)(kCancelSeconds * sr_) && job_ == NONE)
+            RequestRender(clock);
+        if (render_ == R_READY)
+            SwitchToRendered(clock);
+
         if (len_ == 0 || state_ == RECORDING || !(Audible() || env_ > 0.0f))
             return;
-        double ratio = clock.Increment() * (double)len_ / (double)len_ticks_;
-        follow_      = std::fabs(ratio - 1.0) < kFollowRange;
-        if (follow_) {
-            if (p_ >= (double)len_)
-                p_ = std::fmod(p_, (double)len_);
-            double expected = Expected(clock);
-            double err      = expected - p_;
-            if (err > 0.5 * len_)
-                err -= len_;
-            else if (err < -0.5 * len_)
-                err += len_;
-            if (std::fabs(err) > kJumpSeconds * sr_ && post_roll_left_ == 0) {
-                Jump(expected, cur_);
-                rate_ = ratio;
+        double ratio        = clock.Increment() * (double)len_ / (double)len_ticks_;
+        bool   want_stretch = std::fabs(ratio - 1.0) >= kFollowRange;
+        double expected     = Expected(clock);
+        if (want_stretch != stretching_) {  // Crossfade between playing directly and stretching
+            if (want_stretch) {
+                wsola_.Reset(buf_[cur_], len_, expected, stagger_);
+                if (dub_on_ && render_ == R_NONE)
+                    EndDub();  // The tempo moved away during an overdub: punch out
             } else {
-                double nudge = err / (kFollowSeconds * sr_);
-                nudge        = nudge > kMaxNudge ? kMaxNudge : (nudge < -kMaxNudge ? -kMaxNudge : nudge);
-                rate_        = ratio + nudge;
+                p_              = expected;
+                last_idx_valid_ = false;
             }
-        } else {
-            rate_ = 1.0;  // Other tempo: own speed, restarted on every loop boundary
+            stretching_   = want_stretch;
+            mode_xf_left_ = fade_len_;
         }
+        if (stretching_) {
+            p_    = expected;  // The stretcher follows the clock's position directly
+            rate_ = ratio;
+            return;
+        }
+        if (p_ >= (double)len_)
+            p_ = std::fmod(p_, (double)len_);
+        double err = expected - p_;
+        if (err > 0.5 * len_)
+            err -= len_;
+        else if (err < -0.5 * len_)
+            err += len_;
+        if (std::fabs(err) > kJumpSeconds * sr_ && post_roll_left_ == 0) {
+            Jump(expected, cur_);
+            rate_ = ratio;
+        } else {
+            double nudge = err / (kFollowSeconds * sr_);
+            nudge        = nudge > kMaxNudge ? kMaxNudge : (nudge < -kMaxNudge ? -kMaxNudge : nudge);
+            rate_        = ratio + nudge;
+        }
+    }
+
+    // Main loop: re-render a loop for a stretched overdub, if one is waiting. Blocks until done
+    // (or aborted by an undo / clear). Returns true if it rendered.
+    bool RunRender(LoopRenderer& r)
+    {
+        if (render_ != R_RENDER)
+            return false;
+        uint32_t gen = render_gen_;
+        r.Start(buf_[cur_], len_, buf_[cur_ ^ 1], render_new_len_);
+        while (!r.Step(8192))
+            if (render_gen_ != gen)
+                return false;
+        if (render_gen_ != gen)
+            return false;
+        render_ = R_READY;
+        return true;
     }
 
     // Per sample, after clock.Process(). Returns the loop's output (before level / filter).
@@ -334,6 +400,7 @@ class Track
                     p_              = 0.0;
                     last_idx_valid_ = false;
                     state_          = PLAYING;
+                    stretching_     = false;  // Re-decided (and the stretcher reset) next block
                 }
                 break;
             case PLAYING:
@@ -344,8 +411,6 @@ class Track
                         stop_pending_ = false;
                         state_        = STOPPED;
                     }
-                    if (!follow_ && loop_start)
-                        Jump(0.0, cur_);
                 }
                 break;
             default: break;
@@ -371,33 +436,59 @@ class Track
                 BakeSeam();
         }
 
-        float target = Audible() ? 1.0f : 0.0f;
+        float target = Audible() && !swap_pending_ ? 1.0f : 0.0f;
         env_         = Ramp(env_, target);
+        if (swap_pending_ && env_ == 0.0f)
+            FinishDipSwap();  // Undo / redo while stretching: swapped at the bottom of a short dip
         if (env_ == 0.0f && target == 0.0f) {
             dub_env_ = 0.0f;
             return 0.0f;  // Stopped
         }
 
-        float y = Read(cur_, p_);
-        if (xf_left_ > 0) {  // Crossfade from the old position / buffer
-            float g = (float)xf_left_ / (float)fade_len_;
-            y += g * (Read(xf_buf_, xf_p_) - y);
-            xf_p_ += rate_;
-            if (follow_ && xf_p_ >= (double)len_)
-                xf_p_ -= len_;
-            xf_left_--;
+        float y;
+        bool  need_direct = !stretching_ || mode_xf_left_ > 0;
+        bool  need_wsola  = stretching_ || mode_xf_left_ > 0;
+        float direct = 0.0f, stretched = 0.0f;
+        if (need_direct) {
+            direct = Read(cur_, p_, len_);
+            if (xf_left_ > 0) {  // Crossfade from the old position / buffer
+                float g = (float)xf_left_ / (float)fade_len_;
+                direct += g * (Read(xf_buf_, xf_p_, xf_len_) - direct);
+                xf_p_ += rate_;
+                if (xf_p_ >= (double)xf_len_)
+                    xf_p_ -= xf_len_;
+                xf_left_--;
+            }
+        }
+        if (need_wsola)
+            stretched = wsola_.Process(p_, rate_);
+        if (mode_xf_left_ > 0) {  // Between direct playback and the stretcher
+            float g = (float)mode_xf_left_ / (float)fade_len_;
+            float now = stretching_ ? stretched : direct, before = stretching_ ? direct : stretched;
+            y = now + g * (before - now);
+            mode_xf_left_--;
+        } else {
+            y = stretching_ ? stretched : direct;
         }
 
         dub_env_ = Ramp(dub_env_, dub_on_ ? 1.0f : 0.0f);
-        if (dub_env_ > 0.0f && p_ < (double)len_)
+        if (render_ == R_HOLD || render_ == R_RENDER) {
+            // Overdub on a stretched loop: held until the re-rendered loop is there
+            if (dub_env_ > 0.0f && hold_count_ < hold_size_)
+                hold_buf_[hold_count_++] = in * dub_env_;
+            else if (hold_count_ >= hold_size_ && dub_on_)
+                EndDub();  // The render is taking too long: punch out, keep what was played
+            hold_elapsed_++;
+        } else if (dub_env_ > 0.0f && !stretching_ && p_ < (double)len_) {
             WriteDub(in * dub_env_);
-        else
+        } else {
             last_idx_valid_ = false;  // Not writing: the next overdub starts at the playhead
+        }
         if (side_phase_)
             side_elapsed_++;
 
         p_ += rate_;
-        if (follow_ && p_ >= (double)len_)
+        if (p_ >= (double)len_)
             p_ -= len_;
 
         return y * env_;
@@ -417,11 +508,17 @@ class Track
     bool     CanUndo() const { return alt_valid_ && !undone_; }
     bool     CanRedo() const { return alt_valid_ && undone_; }
     bool     Busy() const { return job_ != NONE; }        // Background copy running
-    bool     Following() const { return follow_; }
+    bool     Following() const { return !stretching_; }
+    bool     Stretching() const { return stretching_; }
+    bool     Rendering() const { return render_ == R_HOLD || render_ == R_RENDER; }  // Stretched overdub waiting
+    uint32_t Renders() const { return rendered_; }
+    uint32_t RenderFailures() const { return render_failures_; }
+    void     SetStagger(uint32_t phase) { stagger_ = phase; }  // Track 2: half a grain hop
     double   Position() const { return p_; }              // Samples into the loop
 
   private:
-    enum Job : uint8_t { NONE, COPY_UNDO, RESTORE };
+    enum Job : uint8_t { NONE, COPY_UNDO, RESTORE, FLUSH };
+    enum Render : uint8_t { R_NONE, R_HOLD, R_RENDER, R_READY };
 
     bool Audible() const { return state_ == PLAYING || state_ == OVERDUBBING; }
 
@@ -451,36 +548,29 @@ class Track
         return t * (double)len_ / (double)len_ticks_;
     }
 
-    // Hermite read around the loop (the seam is baked, so wrapping is continuous). Past the
-    // end (other tempo, waiting for the restart) it fades out and goes silent.
-    float Read(int b, double pos) const
+    // Hermite read around a loop of `len` (the seam is baked, so wrapping is continuous)
+    float Read(int b, double pos, uint32_t len) const
     {
-        if (pos >= (double)len_) {
-            if (follow_)
-                pos = std::fmod(pos, (double)len_);
-            else
-                return 0.0f;
-        }
+        if (pos >= (double)len)
+            pos = std::fmod(pos, (double)len);
         const float* x  = buf_[b];
         uint32_t     i  = (uint32_t)pos;
         float        f  = (float)(pos - (double)i);
-        uint32_t     im = i == 0 ? len_ - 1 : i - 1;
-        uint32_t     i1 = i + 1 >= len_ ? i + 1 - len_ : i + 1;
-        uint32_t     i2 = i1 + 1 >= len_ ? i1 + 1 - len_ : i1 + 1;
+        uint32_t     im = i == 0 ? len - 1 : i - 1;
+        uint32_t     i1 = i + 1 >= len ? i + 1 - len : i + 1;
+        uint32_t     i2 = i1 + 1 >= len ? i1 + 1 - len : i1 + 1;
         float        xm1 = x[im], x0 = x[i], x1 = x[i1], x2 = x[i2];
         float        c1 = 0.5f * (x1 - xm1);
         float        c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
         float        c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-        float        y  = ((c3 * f + c2) * f + c1) * f + x0;
-        if (!follow_ && (double)len_ - pos < (double)fade_len_)
-            y *= (float)(((double)len_ - pos) / fade_len_);
-        return y;
+        return ((c3 * f + c2) * f + c1) * f + x0;
     }
 
     void Jump(double to, int from_buf)
     {
         xf_p_           = p_;
         xf_buf_         = from_buf;
+        xf_len_         = len_;
         xf_left_        = fade_len_;
         p_              = to;
         last_idx_valid_ = false;
@@ -558,6 +648,9 @@ class Track
         p_              = (double)(rec_count_ - samples);  // Already this far into the next time around
         rate_           = 1.0;
         follow_         = true;
+        stretching_     = false;
+        mode_xf_left_   = 0;
+        alt_len_        = samples;
         last_idx_valid_ = false;
         env_            = 0.0f;
         // Recording carries on until the tail past the end is in (input latency later than the clock)
@@ -601,10 +694,21 @@ class Track
         return WriteIndex();
     }
 
-    void StartDub()
+    void StartDub(const Clock& clock)
     {
         state_  = OVERDUBBING;
         dub_on_ = true;
+        if (render_ != R_NONE)
+            return;  // Punched in again while the last stretched overdub waits: same one
+        if (stretching_) {
+            // Hold the overdub aside; the loop gets re-rendered at this tempo first
+            render_       = R_HOLD;
+            hold_count_   = 0;
+            hold_elapsed_ = 0;
+            double t      = std::fmod(clock.Position() - (double)anchor_, (double)len_ticks_);
+            hold_p0_      = t < 0.0 ? t + len_ticks_ : t;
+            return;
+        }
         if (side_phase_)
             return;  // Still in the last one's cancel window (punched out and in again): same session
         if (job_ == RESTORE)
@@ -621,7 +725,7 @@ class Track
         if (state_ == OVERDUBBING)
             state_ = PLAYING;
         dub_on_ = false;
-        if (side_phase_)
+        if (side_phase_ && render_ == R_NONE)
             Commit(NextWriteIndex());
     }
 
@@ -629,6 +733,8 @@ class Track
     // before it, in the background, starting at `start` (just ahead of the playhead)
     void Commit(uint32_t start)
     {
+        if (job_ == FLUSH)
+            RunJobToEnd();  // Rare: a stretched overdub is still being written in
         side_phase_      = false;
         job_             = COPY_UNDO;
         job_start_       = start % len_;
@@ -648,6 +754,10 @@ class Track
         dub_env_ = 0.0f;
         if (state_ == OVERDUBBING)
             state_ = PLAYING;
+        if (render_ != R_NONE) {
+            AbortStretchedDub();
+            return;
+        }
         if (!side_phase_)
             return;
         side_phase_ = false;
@@ -666,10 +776,85 @@ class Track
 
     void SwapBuffers()
     {
-        int old = cur_;
+        if (stretching_) {  // Through a short dip (two stretchers' worth of state isn't worth it)
+            swap_pending_ = true;
+            return;
+        }
+        int      old     = cur_;
+        uint32_t old_len = len_;
         cur_ ^= 1;
-        undone_ = !undone_;
-        Jump(p_, old);  // Crossfade over to the other version
+        len_     = alt_len_;
+        alt_len_ = old_len;
+        undone_  = !undone_;
+        Jump(p_ * len_ / old_len, old);  // Crossfade over to the other version (maybe another length)
+        xf_len_ = old_len;
+    }
+
+    void FinishDipSwap()
+    {
+        swap_pending_    = false;
+        uint32_t old_len = len_;
+        cur_ ^= 1;
+        len_     = alt_len_;
+        alt_len_ = old_len;
+        undone_  = !undone_;
+        p_       = p_ * len_ / old_len;
+        stretching_   = false;  // Re-decided next block, with a fresh stretcher on this buffer
+        mode_xf_left_ = 0;
+    }
+
+    // The cancel window of a stretched overdub is over: ask the main loop for the re-render
+    void RequestRender(const Clock& clock)
+    {
+        uint32_t n = (uint32_t)std::lround(len_ticks_ * clock.SamplesPerTickNominal());
+        if (n + LoopRenderer::kSeam + 1 > capacity_ || n < 4 * WsolaPlayer::kGrain) {
+            AbortStretchedDub();  // Doesn't fit at this tempo
+            if (state_ == OVERDUBBING)
+                state_ = PLAYING;
+            render_failures_++;
+            return;
+        }
+        render_new_len_ = n;
+        alt_valid_      = false;  // The undo buffer is about to hold the new version
+        render_         = R_RENDER;
+    }
+
+    // The re-rendered loop is ready: play it, write the held overdub into it
+    void SwitchToRendered(const Clock& clock)
+    {
+        alt_len_   = len_;
+        len_       = render_new_len_;
+        cur_ ^= 1;
+        alt_valid_ = true;  // The original, untouched, at its own tempo
+        undone_    = false;
+        side_phase_ = false;
+        p_          = Expected(clock);
+        last_idx_valid_ = false;
+        // The stretcher keeps playing the original for the crossfade
+        if (stretching_) {
+            stretching_   = false;
+            mode_xf_left_ = fade_len_;
+        }
+        // Held overdub: sample k was played when the clock was at hold_p0_ ticks + k samples
+        uint32_t behind = kWriteBehind + (settings_.latency < len_ / 2 ? settings_.latency : len_ / 2);
+        int64_t  i0     = (int64_t)std::llround(hold_p0_ * len_ / len_ticks_) - behind;
+        flush_idx0_     = (uint32_t)(((i0 % (int64_t)len_) + len_) % len_);
+        flush_buf_      = cur_;
+        job_            = hold_count_ > 0 ? FLUSH : NONE;
+        job_done_       = 0;
+        render_         = R_NONE;
+        rendered_++;
+    }
+
+    void AbortStretchedDub()
+    {
+        if (render_ == R_RENDER)
+            alt_valid_ = false;  // The render had started overwriting the undo buffer
+        render_gen_++;           // A render in the main loop stops
+        render_     = R_NONE;
+        hold_count_ = 0;
+        dub_on_     = false;
+        dub_env_    = 0.0f;
     }
 
     // Overdub write at the playhead. With the rate a hair off 1.0 the index sometimes moves by
@@ -717,6 +902,22 @@ class Track
     {
         if (job_ == NONE)
             return;
+        if (job_ == FLUSH) {  // The held overdub into the re-rendered loop
+            float*   loop = buf_[flush_buf_];
+            uint32_t n    = hold_count_ - job_done_ < kCopyPerBlock ? hold_count_ - job_done_ : kCopyPerBlock;
+            uint32_t i    = (uint32_t)(((uint64_t)flush_idx0_ + job_done_) % len_);
+            for (uint32_t j = 0; j < n; j++) {
+                loop[i] += hold_buf_[job_done_ + j];
+                if (++i >= len_)
+                    i = 0;
+            }
+            job_done_ += n;
+            if (job_done_ >= hold_count_) {
+                job_        = NONE;
+                hold_count_ = 0;
+            }
+            return;
+        }
         if (job_ == COPY_UNDO) {
             // Indices counted along, no division per sample: this runs 2048 samples per block
             const float* loop = buf_[cur_];
@@ -791,7 +992,21 @@ class Track
     bool     follow_;
     double   xf_p_;
     int      xf_buf_;
-    uint32_t xf_left_;
+    uint32_t xf_left_, xf_len_ = 1;
+    uint32_t alt_len_ = 0;  // Length of the undo / redo version (a re-render changes it)
+
+    // Time stretch
+    WsolaPlayer       wsola_;
+    bool              stretching_ = false, swap_pending_ = false;
+    uint32_t          stagger_ = 0;  // Grain phase offset vs. the other track (their searches don't coincide)
+    uint32_t          mode_xf_left_ = 0;
+    float*            hold_buf_ = nullptr;
+    uint32_t          hold_size_ = 0, hold_count_ = 0, hold_elapsed_ = 0;
+    double            hold_p0_ = 0.0;
+    volatile Render   render_ = R_NONE;
+    volatile uint32_t render_gen_ = 0;
+    uint32_t          render_new_len_ = 0, flush_idx0_ = 0, rendered_ = 0, render_failures_ = 0;
+    int               flush_buf_ = 0;
     float    env_;
     bool     stop_pending_, paused_by_midi_;
     StopMode stop_mode_;

@@ -73,7 +73,7 @@ since Start". Once ticks are lost, the pedal can't know where the bar is until t
 | `Continue` | loops stopped by `Stop` resume where they were (or at the `SPP` position, if one was sent) |
 | `Start` | bar position resets to bar 1; loops stopped by `Stop` restart from the top; playing loops re-align with a crossfade |
 | No MIDI clock | tempo knob sets the tempo |
-| Tempo changes while loops exist | until the stretcher exists: loops keep their recorded tempo, LED warns, re-follows when tempo returns or on `Start`. With the stretcher: loops follow, pitch unchanged |
+| Tempo changes while loops exist | loops follow, time-stretched, pitch unchanged (direct playback again within 0.6 % of the recorded tempo) |
 
 MIDI has no Pause message: a DAW/clock "pause" is `Stop` → (optional `SPP`) → `Continue`.
 Only loops stopped *by MIDI* auto-resume; a track you stopped with the footswitch stays stopped.
@@ -125,7 +125,16 @@ Latency compensation: shift the record window by a fixed, measured input latency
 ### Seams
 ~5 ms crossfade at every loop seam, on stop/start and on `Start` re-alignment — no clicks.
 
-### Time-stretch (later phase)
+### Time-stretch (phase 7, `stretch.h`)
+Built as below. WSOLA grains of 1024 samples, hop 512, search +-8 ms in three stages (coarse /
+medium / fine, ~10k multiply-adds per grain); the two tracks' grains are staggered by half a hop
+so their searches never fall in the same audio block. Within +-0.6 % of the recorded tempo a loop
+plays directly (bit-exact, PLL nudges as varispeed); beyond that it crossfades (5 ms) into the
+stretcher. Overdubbing a stretched loop holds the overdub aside, re-renders the loop at the
+current tempo into the undo buffer after the cancel window (main loop), crossfades over and writes
+the held overdub in; undo returns the original at its own length.
+
+### Time-stretch (design)
 - Loops are stored at their recorded tempo; playback ratio = current tempo / recorded tempo.
 - **WSOLA** (overlap-add of short grains, aligned by cross-correlation): pitch-neutral, cheap
   enough for 2 mono tracks on the Cortex-M7, sounds good for guitar at moderate ratios (±~15 %).

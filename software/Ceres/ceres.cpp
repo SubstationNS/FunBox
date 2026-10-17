@@ -13,6 +13,7 @@
 #include "persist.h"
 #include "latency.h"
 #include "eventlog.h"
+#include "stretch.h"
 #include <cstdarg>
 
 //
@@ -91,6 +92,10 @@ static const uint32_t kLoopCapacity = 3600000;
 static const uint32_t kSideSize     = 72000;  // 1.5 s, more than Track::kCancelSeconds
 float DSY_SDRAM_BSS loop_buf[2][2][kLoopCapacity];
 float DSY_SDRAM_BSS side_buf[2][2][kSideSize];
+// An overdub on a stretched loop waits here while the loop is re-rendered at the new tempo
+static const uint32_t kHoldSize = 8 * 48000;
+float DSY_SDRAM_BSS hold_buf[2][kHoldSize];
+ceres::LoopRenderer renderer;  // Main loop, one track at a time
 
 // Parameters (pickup, CC, morph) and their saved state
 ceres::Controls      controls;
@@ -319,8 +324,8 @@ void ProcessMidi(uint32_t block_time)
 
 // MIDI clock when there is one. Otherwise the pinned tempo or knob 2; after a MIDI clock goes
 // away its last tempo stays until knob 2 moves (or a new T command), so losing it is inaudible.
-// While a track has a loop (or is recording one) the tempo is locked: loops can't stretch yet.
-// Clearing them hands the tempo back to knob 2 once it moves.
+// Loops follow tempo changes (time-stretched, pitch unchanged). Only while one is being recorded
+// is the tempo held, so the recording's length in bars is what was played.
 void UpdateTempo(float knob)
 {
     if (tempo_restored) {  // Saved tempo: knob 2 only takes over once it moves
@@ -331,8 +336,8 @@ void UpdateTempo(float knob)
             return;
         tempo_restored = false;
     }
-    bool loops = tracks[0].GetState() != ceres::Track::EMPTY || tracks[1].GetState() != ceres::Track::EMPTY;
-    if (midi_sync.Locked() || loops) {
+    bool recording = tracks[0].GetState() == ceres::Track::RECORDING || tracks[1].GetState() == ceres::Track::RECORDING;
+    if (midi_sync.Locked() || recording) {
         knob_has_tempo   = false;
         tempo_from_midi |= midi_sync.Locked();
         knob_at_handover = knob;
@@ -820,7 +825,8 @@ void FormatTrack(char* out, size_t size, int n)
     if (t.GetState() == ceres::Track::RECORDING && t.EndTicks())
         snprintf(end, sizeof(end), " ->%lu", t.EndTicks() / 96);
     int db = track_rms[n] > 1e-5f ? (int)roundf(20.0f * log10f(track_rms[n])) : -99;
-    snprintf(out, size, "T%d %s%s%s%s%s%s %ddB", n + 1, kStateNames[t.GetState()], len, end,
+    snprintf(out, size, "T%d %s%s%s%s%s%s%s %ddB", n + 1, kStateNames[t.GetState()], len, end,
+             t.Rendering() ? " rendering" : (t.Stretching() ? " stretched" : ""),
              t.StopPending() ? " stopping" : "", t.CanUndo() ? " undo" : (t.CanRedo() ? " redo" : ""),
              t.PausedByMidi() ? " (midi)" : "", db);
 }
@@ -1190,7 +1196,9 @@ int main(void)
     pending_snap = saved_snap;
 
     for (int t = 0; t < 2; t++) {
-        tracks[t].Init(sample_rate, loop_buf[t][0], loop_buf[t][1], kLoopCapacity, side_buf[t][0], side_buf[t][1], kSideSize);
+        tracks[t].Init(sample_rate, loop_buf[t][0], loop_buf[t][1], kLoopCapacity, side_buf[t][0], side_buf[t][1], kSideSize,
+                       hold_buf[t], kHoldSize);
+        tracks[t].SetStagger(t * ceres::WsolaPlayer::kHop / 2);
         filters[t].Init(sample_rate);
         limiters[t].Init(sample_rate);
         level_slew[t].Init(20.0f, sample_rate);
@@ -1275,6 +1283,15 @@ int main(void)
                 if (store.Save(snap))
                     saved_snap = pending_snap = snap;
             }
+        }
+        // Overdub on a stretched loop: re-render it at the new tempo (blocks the main loop meanwhile)
+        for (int t = 0; t < 2; t++) {
+            if (!tracks[t].Rendering())
+                continue;
+            uint32_t start = System::GetNow();
+            if (tracks[t].RunRender(renderer))
+                Log("T%d re-rendered at %d BPM for an overdub: %lu samples in %lu ms", t + 1, (int)roundf(clock.Tempo()),
+                    tracks[t].LengthSamples(), System::GetNow() - start);
         }
         MonitorAndLog();
         if (log_dump_requested)

@@ -6,3 +6,4 @@ loader/build/
 test/params_test
 test/latency_test
 test/log_test
+test/stretch_test

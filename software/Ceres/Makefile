@@ -6,7 +6,7 @@ TARGET = ceres
 APP_TYPE = BOOT_SRAM
 
 # Compiler options
-OPT=-Os
+OPT=-O2  # Runs from RAM (480 KB): speed over size
 
 # Sources
 CPP_SOURCES = ceres.cpp

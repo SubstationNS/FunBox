@@ -40,7 +40,7 @@ struct Rig
     Clock            clock;
     Track            track;
     Track::Settings  settings;
-    std::vector<float> a, b, side_a, side_b;
+    std::vector<float> a, b, side_a, side_b, hold;
     uint64_t         n = 0;
     std::function<double(double)> input = [](double) { return 0.0; };
     bool             transport = true;
@@ -58,11 +58,21 @@ struct Rig
         side_a.assign(side, 0.0f);
         side_b.assign(side, 0.0f);
         clock.Init((float)kSampleRate, (float)bpm);
-        track.Init((float)kSampleRate, a.data(), b.data(), cap, side_a.data(), side_b.data(), side);
+        hold.assign((size_t)(8 * kSampleRate), 0.0f);
+        track.Init((float)kSampleRate, a.data(), b.data(), cap, side_a.data(), side_b.data(), side, hold.data(), (uint32_t)hold.size());
     }
+
+    ceres::LoopRenderer renderer;
+    int  render_delay = 20;  // Blocks the "main loop" takes before it renders (it's busy elsewhere)
+    int  render_wait  = 0;
 
     void Block()
     {
+        // The main loop's part: re-render when asked (here: instantly, after a little while)
+        if (track.Rendering() && ++render_wait > render_delay) {
+            if (track.RunRender(renderer))
+                render_wait = 0;
+        }
         track.BeginBlock(clock, settings, transport);
         for (int i = 0; i < kBlock; i++) {
             uint8_t ev = clock.Process();
@@ -299,6 +309,26 @@ static void TestEndings()
         r.Run(2.1);
         CHECK(r.track.GetState() == Track::RECORDING, "and records once it plays");
     }
+}
+
+// Amplitude of a sine at hz in the output over [from, to): measured in short windows and averaged,
+// so it doesn't matter that the loop's passes are at different phases against the clock
+static double Amplitude(const Rig& r, uint64_t from, uint64_t to, double hz)
+{
+    const uint64_t kWin = 4096;
+    double sum = 0;
+    int    n   = 0;
+    for (uint64_t w = from; w + kWin <= to; w += kWin) {
+        double c = 0, s2 = 0;
+        for (uint64_t i = w; i < w + kWin; i++) {
+            double ph = 2.0 * kPi * hz * i / kSampleRate;
+            c += r.out[i] * std::cos(ph);
+            s2 += r.out[i] * std::sin(ph);
+        }
+        sum += 2.0 * std::sqrt(c * c + s2 * s2) / kWin;
+        n++;
+    }
+    return n ? sum / n : 0.0;
 }
 
 // One-bar loop of A, then overdubs
@@ -609,27 +639,125 @@ static void TestFollowsClock()
     delete &r;
 }
 
-// Different tempo: loop keeps its speed, restarts on every loop boundary
+// Different tempo: the loop is time-stretched, pitch stays, still on the clock's bar lines
 static void TestOtherTempo()
 {
-    std::printf("track: other tempo\n");
+    std::printf("track: other tempo (time stretch)\n");
     Rig& r = *LoopOfA();
-    r.clock.SetTempo(126.0f);  // 5 % faster: loop ends after the boundary... no: boundary comes first
-    r.RunToBar(6.0);
-    CHECK(!r.track.Following(), "not following a 5 %% tempo change");
-    // Right after a bar line (= loop boundary) the loop is back at its start
-    r.RunToBar(7.0 + 0.002);
-    CHECK(r.track.Position() < 0.01 * kSampleRate, "restarted at the boundary (pos %.0f)", r.track.Position());
+    r.clock.SetTempo(132.0f);  // 10 % faster
+    r.Run(0.5);
+    CHECK(r.track.Stretching(), "stretching at a 10 %% faster tempo");
+    uint64_t from = r.n;
+    r.Run(6.0);
+    double a220 = Amplitude(r, from, r.n, 220.0);
+    CHECK(std::fabs(a220 - 0.30) < 0.03, "pitch unchanged: the 220 Hz loop is still 220 Hz (amplitude %.3f)", a220);
+    double natural = 0.30 * 2.0 * kPi * 220.0 / kSampleRate;
+    double step    = r.MaxStep(from, r.n);
+    CHECK(step < 1.5 * natural, "no clicks while stretched: %.4f", step);
+    // On the bar lines: the loop's start comes around on every bar (it's a 1-bar loop)
+    double worst = 0;
+    double spb   = kSampleRate * 60.0 / 132.0 * 4.0;
+    for (uint64_t i = from + 1; i < r.n; i++)
+        if (r.pos[i] < r.pos[i - 1]) {
+            double bars = (i - r.rec_start * 0.0) / spb;
+            (void)bars;
+        }
+    double off = std::fmod(r.clock.Position() - (double)r.rec_start / r.SamplesPerBar() * 96.0, 96.0) / 96.0 * r.track.LengthSamples()
+                 - r.track.Position();
+    worst = std::fabs(off);
+    CHECK(worst < 2.0, "position follows the clock (%.1f samples off)", worst);
+    r.clock.SetTempo(120.0f);
+    r.Run(1.0);
+    CHECK(r.track.Following(), "plays directly again back at 120");
+    uint64_t back = r.n;
+    r.Run(2.0);
+    double e = CheckModel(r, 2.0, [&](uint64_t, double q) { return r.LoopA(q); });
+    CHECK(e < 0.01, "and exactly as recorded, error %.4f", e);
+    CHECK(r.MaxStep(back - 2000, r.n) < 1.5 * natural, "no click switching back");
+    std::printf("  132 BPM: 220 Hz amplitude %.3f (0.30 recorded), steps %.4f; back at 120: error %.4f\n", a220, step, e);
+    delete &r;
+}
+
+// Overdub while stretched: the loop is re-rendered at the new tempo, the overdub goes into it;
+// undo brings back the original at its own tempo
+static void TestStretchedOverdub()
+{
+    std::printf("track: overdub at another tempo\n");
+    Rig& r = *LoopOfA();
+    r.Run(0.1);
+    uint32_t len120 = r.track.LengthSamples();
+    r.clock.SetTempo(100.0f);
+    r.RunToBar(std::ceil(r.clock.Position() / 96.0) + 0.02);
+    r.input = SineB;
+    r.track.Tap(r.clock);
+    CHECK(r.track.Rendering(), "overdub held while the loop gets re-rendered");
+    r.RunToBar(std::ceil(r.clock.Position() / 96.0) + 0.02);  // One pass of the 1-bar loop
+    r.track.Tap(r.clock);
+    r.input = [](double) { return 0.0; };
+    r.Run(1.0);
+    CHECK(!r.track.Rendering() && r.track.Renders() == 1, "rendered (%u)", r.track.Renders());
+    uint32_t len100 = r.track.LengthSamples();
+    double   want   = len120 * 120.0 / 100.0;
+    CHECK(std::fabs(len100 - want) < 2.0, "new length for 100 BPM: %u (want %.0f)", len100, want);
+    CHECK(!r.track.Stretching(), "the new loop plays directly at 100");
     uint64_t from = r.n;
     r.Run(4.0);
-    double step = r.MaxStep(from, r.n);
-    CHECK(step < 0.05, "restarts are crossfaded: step %.4f", step);
-    r.clock.SetTempo(120.0f);
+    double a220 = Amplitude(r, from, r.n, 220.0), a330 = Amplitude(r, from, r.n, 330.7);
+    std::printf("  100 BPM: 220 Hz (re-rendered loop) %.3f, 330.7 Hz (overdub) %.3f\n", a220, a330);
+    CHECK(std::fabs(a220 - 0.30) < 0.04, "re-rendered loop at its level: %.3f", a220);
+    CHECK(std::fabs(a330 - 0.20) < 0.02, "the overdub is in, at its level: %.3f", a330);
+
+    r.track.Undo();
+    r.Run(0.5);
+    CHECK(r.track.LengthSamples() == len120 && r.track.Stretching(), "undo: the original, stretched again (len %u)",
+          r.track.LengthSamples());
+    from = r.n;
     r.Run(3.0);
-    CHECK(r.track.Following(), "follows again when the tempo is back");
-    double e = CheckModel(r, 2.0, [&](uint64_t, double q) { return r.LoopA(q); });
-    CHECK(e < 0.01, "and plays normally, error %.4f", e);
-    std::printf("  126 BPM: restarts on the boundary, steps %.4f; back at 120: error %.4f\n", step, e);
+    a220 = Amplitude(r, from, r.n, 220.0);
+    a330 = Amplitude(r, from, r.n, 330.7);
+    CHECK(std::fabs(a220 - 0.30) < 0.04 && a330 < 0.02, "undo: just the original (220 %.3f, 330 %.3f)", a220, a330);
+    r.track.Undo();
+    r.Run(0.5);
+    CHECK(r.track.LengthSamples() == len100 && !r.track.Stretching(), "redo: the re-rendered one again");
+    std::printf("  undo -> original %u samples (stretched), redo -> %u samples\n", len120, len100);
+    delete &r;
+}
+
+// Double tap / hold within the cancel window: nothing is rendered, the previous undo stays
+static void TestStretchedCancel()
+{
+    std::printf("track: cancelling an overdub at another tempo\n");
+    Rig& r = *LoopOfA();
+    r.RunToBar(3.0);  // An overdub at 120 first, so there's something to undo
+    r.input = SineB;
+    r.track.Tap(r.clock);
+    r.RunToBar(4.0);
+    r.track.Tap(r.clock);
+    r.input = [](double) { return 0.0; };
+    r.Run(2.0);
+    CHECK(r.track.CanUndo(), "undo point from the 120 overdub");
+    r.clock.SetTempo(110.0f);
+    r.Run(0.5);
+    r.input = SineC;
+    r.track.Tap(r.clock);
+    r.Run(0.2);
+    r.track.DoubleTap(r.clock);  // Take it back, stop
+    r.Run(2.0);
+    CHECK(r.track.Renders() == 0 && r.track.CanUndo(), "double tap: nothing rendered, undo point kept");
+    r.track.Tap(r.clock);  // Play again
+    r.RunToBar(std::ceil(r.clock.Position() / 96.0) + 0.1);
+    r.Run(0.5);
+    // Hold while stretched: the press's overdub is taken back, then the 120 overdub is undone
+    r.track.Tap(r.clock);
+    r.Run(1.0);
+    r.track.Undo();
+    r.input = [](double) { return 0.0; };
+    r.Run(0.5);
+    CHECK(r.track.Renders() == 0 && r.track.CanRedo(), "hold: no render, the earlier overdub undone (redo available)");
+    uint64_t from = r.n;
+    r.Run(3.0);
+    double a330 = Amplitude(r, from, r.n, 330.7), a497 = Amplitude(r, from, r.n, 497.3);
+    CHECK(a330 < 0.02 && a497 < 0.02, "left with just the first take (330 %.3f, 497 %.3f)", a330, a497);
     delete &r;
 }
 
@@ -682,6 +810,8 @@ int main()
     TestStopModes();
     TestFollowsClock();
     TestOtherTempo();
+    TestStretchedOverdub();
+    TestStretchedCancel();
     TestTransport();
     if (failures)
         std::printf("%d FAILED\n", failures);

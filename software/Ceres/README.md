@@ -1,8 +1,8 @@
 # Ceres
 MIDI-synced dual-track bar looper. Design: [docs/looper-design.md](../../docs/looper-design.md)
 
-Status: **two tracks, MIDI clock sync + CC, loop FX, expression morph, saved settings** (design
-phases 1–6). Still to come: time-stretch, then the "maybe later" list.
+Status: **two tracks, MIDI clock sync + CC, loop FX, expression morph, saved settings, time
+stretch, latency calibration, black-box log** (design phases 1–7). Next: the "maybe later" list.
 
 ## Build and flash
 
@@ -40,7 +40,7 @@ register locked while WP# is low), so every erase failed, including the Daisy bo
 | Both footswitches | Stop all (if anything plays) / start all (from the next bar) |
 | Knob 1 / 3 | Track 1 / 2 level: silent → unity at about 2 o'clock → +6 dB |
 | Knob 4 / 6 | Track 1 / 2 filter: low-pass ← flat at noon → high-pass |
-| Knob 2 | Tempo, 60-200 BPM; only without MIDI clock and while both tracks are empty |
+| Knob 2 | Tempo, 60-200 BPM; only without MIDI clock. Loops follow (time-stretched, pitch unchanged); held while a recording runs |
 | Knob 5 | FX amount on the loops (0 = off) |
 | 3-way 1 | Grid for double-tap endings: 1/4 / 1/8 / 1/16 |
 | 3-way 2 | FX: Tape / Delay / Repeat |
@@ -66,6 +66,12 @@ Per footswitch:
 - Overdubs can be taken back for 1.2 s (double tap / hold), without losing the previous undo.
 - Dry always passes at unity; loops (and the FX) are added; a limiter catches hot stacks.
 - Loop memory: 75 s per track.
+- Tempo changes (knob 2 or MIDI clock): loops follow, time-stretched with the pitch unchanged.
+  Within 0.6 % of the tempo a loop was recorded at it plays untouched (bit-exact).
+- Overdubbing a stretched loop: the overdub starts right away; after its cancel window (1.2 s) the
+  loop is re-rendered at the current tempo (well under a second for a few bars, ~3.5 s for 75 s),
+  playback crossfades over and the overdub goes in. Undo brings back the original recording, at
+  its own tempo. The re-rendered loop is one generation of stretching; new layers are clean.
 
 ### Knobs, expression pedal, saved settings
 
@@ -167,7 +173,9 @@ Seed's knobs float).
 CPU load (both channels, full amount, measured on the Seed): delay 11 %, repeat 3 %, tape 20 %,
 all three in series 33 %. Syncing to MIDI clock adds up to ~8 % on the block a tick lands in.
 Worst case, both tracks playing and one overdubbing with all three FX in series: 37 %, up to 60 %
-for a moment when an overdub is committed (its undo copy runs in the background).
+for a moment when an overdub is committed (its undo copy runs in the background). Both tracks
+time-stretched: 19 % average, 40 % peak (the blocks where a new grain is placed); with all three FX
+in series 33 % / 54 %, 75 % for a moment when a stretched overdub switches over.
 
 ## Host tests
 
@@ -204,6 +212,13 @@ Latency probe (fractional delays through a simulated codec, no-cable detection) 
 ```
 c++ -std=c++17 -O2 -I.. latency_test.cpp -o latency_test && ./latency_test
 c++ -std=c++17 -O2 -I.. log_test.cpp -o log_test && ./log_test
+```
+
+Time stretch (pitch at ratios 0.5-2, no clicks, beats where the clock puts them, re-rendered loops
+wrap seamlessly); pass a directory to also get WAVs (original, re-rendered at 100 / 150 BPM, a
+knob sweep 120 -> 80 -> 160):
+```
+c++ -std=c++17 -O2 -I.. stretch_test.cpp -o stretch_test && ./stretch_test /tmp/wav
 ```
 
 FX demo: renders a plucked riff through each FX (same code as the pedal) to WAV files:
