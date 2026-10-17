@@ -225,6 +225,8 @@ float knob_at_handover;
 // MIDI diagnostics, read in the main loop
 volatile uint32_t midi_ticks, midi_starts, midi_stops, midi_continues, midi_spp, midi_cc, midi_other;
 volatile uint32_t midi_dropped, uart_restarts;
+volatile uint32_t uart_bytes;  // Bytes in through the MIDI jack (not USB)
+volatile uint8_t  uart_first_byte;
 
 
 // Whole BPM with hysteresis, so pot noise can't wobble the tempo
@@ -271,6 +273,9 @@ void MidiUartReceive(uint8_t* data, size_t size, void*)
     uint32_t now = System::GetTick();
     if (USART1->ISR & USART_ISR_IDLE)
         now -= midi_byte_ticks;
+    if (uart_bytes == 0 && size > 0)
+        uart_first_byte = data[0];
+    uart_bytes += size;
     for (size_t i = 0; i < size; i++)
         QueueMidiByte(data[i], now - (uint32_t)(size - 1 - i) * midi_byte_ticks);
 }
@@ -1059,6 +1064,11 @@ void MonitorAndLog()
         Log("MIDI bytes dropped (%lu so far)", midi_dropped);
     if (save_failures != last_failures)
         Log("saving settings FAILED (%lu so far)", save_failures);
+    static bool jack_seen;
+    if (!jack_seen && uart_bytes > 0) {
+        Log("MIDI jack: receiving (first byte 0x%02x)", uart_first_byte);
+        jack_seen = true;
+    }
     last_starts = midi_starts, last_stops = midi_stops, last_conts = midi_continues;
     last_uart = uart_restarts, last_dropped = midi_dropped, last_failures = save_failures;
 
@@ -1077,6 +1087,12 @@ void MonitorAndLog()
             kLogStates[tracks[0].GetState()], tracks[0].HasLoop() ? t1 : "", kLogStates[tracks[1].GetState()],
             tracks[1].HasLoop() ? t2 : "");
         (void)ms_tick;
+        static uint32_t last_jack_bytes, last_jack_ticks;
+        if (uart_bytes != last_jack_bytes)  // Only minutes the jack got something
+            Log("1m: MIDI jack %lu bytes, clocks %lu, UART errors %lu", uart_bytes - last_jack_bytes,
+                midi_ticks - last_jack_ticks, uart_restarts);
+        last_jack_bytes = uart_bytes;
+        last_jack_ticks = midi_ticks;
         minute_err_peak_ms = 0.0f;
         minute_limit_blocks = 0;
         minute_cpu_peak = minute_cpu_sum = 0.0f;
