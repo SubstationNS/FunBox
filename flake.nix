@@ -21,6 +21,8 @@
             # Flashing / debugging
             dfu-util   # make program-dfu
             openocd    # make program (ST-Link)
+            tio        # USB serial log (tio /dev/ttyACM0)
+            usbutils   # lsusb, used by software/Ceres/flash.sh
           ];
 
           shellHook = ''
