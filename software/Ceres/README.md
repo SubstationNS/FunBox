@@ -127,6 +127,11 @@ deliberate value, and DAW automation has to apply right away.
 
 LEDs: recording = bright, overdub = fast blink, playing = dim with a dip on every beat (longer on
 bar 1), armed = blinks on the beat, stopping = dim blink, stopped = faint glow, empty = faint beat flash.
+- Recording with its end set (tap, power of two, MIDI preset length) counts down: at each bar line
+  one short dip per bar still to go after this one, and in the last bar a dip on every beat (4-3-2-1).
+- MIDI clock lost (the pedal runs on at its last tempo): both LEDs breathe slowly, over whatever they
+  show, until the clock comes back or knob 2 takes the tempo.
+- A knob or the pedal taking over a parameter: a short flash. DIP 4 learn: both flash, then breathe.
 
 MIDI in is a Type A TRS jack. When the MIDI clock goes away, the pedal keeps going at the last tempo
 and bar position; knob 2 takes over again once you move it.
@@ -162,7 +167,8 @@ Dev commands over USB serial (`tio /dev/ttyACM0`): `T<bpm>` pins the tempo, `F<0
 (tape/delay/repeat), `A<0-100>` the FX amount, `S` toggles a stress test (all three FX in series),
 `K` hands everything back to the controls, `B` reboots into the STM32 ROM bootloader (DFU),
 `W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip.
-`L` dumps the log, `C` runs the latency calibration right away.
+`L` dumps the log, `C` runs the latency calibration right away, `E` prints both LED levels every
+50 ms for 15 s.
 `X<k><vvv>` / `Y1` `Y0` pin knob / pedal readings and DIP 4 (after `N`), `R` restarts, `Z` resets the
 settings to defaults. `test/params_inject.py` tests pickup, the morph, MIDI CC and saving with them. MIDI injection: raw bytes
 0xF8-0xFF (clock, Start, Continue, Stop) and `M<hex>` (e.g. `Mf20001` = Song Position bar 9) go

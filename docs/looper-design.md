@@ -178,7 +178,8 @@ Overdub is classic: the existing loop is kept at full level, new input is added.
 - Latency compensation: a loopback calibration (hold footswitch 1 at power-up, cable Out L -> In L)
   measures the round trip; overdubs are written that far behind the playhead, first recordings
   skip half of it (the input side). Saved with the settings.
-- Still open: the LED countdown for power-of-two endings, the "free-running" LED pulse.
+- LEDs: recording with its end set counts down (one dip per bar to go at each bar line, a dip on
+  every beat in the last bar); MIDI clock lost = both LEDs breathe slowly.
 
 ## Signal flow (dual mono)
 

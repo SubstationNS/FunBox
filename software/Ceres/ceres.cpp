@@ -171,6 +171,7 @@ bool              split_mode;
 //             filters flat, FX 0, pedal 0; K releases. X<k><vvv> sets pinned control k (0-4 =
 //             knobs 1, 3, 4, 6, 5; 5 = pedal) to vvv %, e.g. X0050. Y1 / Y0: DIP 4 on / off.
 //   R         restart (tests the saved state). Z: back to defaults (morph cleared, knobs apply)
+//   E         print both LED levels every 50 ms for 15 s (the bare Seed has no FunBox LEDs).
 //   L         dump the black-box log. C: latency calibration now (like holding footswitch 1 at power-up)
 //   Q         check the QSPI chip, lift a write protection (see updater.h)
 volatile bool  bootloader_requested, daisy_bootloader_requested;
@@ -190,6 +191,8 @@ volatile bool  neutral_mix;
 float          pinned_raw[6] = {0.7071f, 0.7071f, 0.5f, 0.5f, 0.0f, 0.0f};  // N mode: knobs 1, 3, 4, 6, 5, pedal
 volatile bool  dip4_injected;
 volatile bool  reset_requested, defaults_requested;
+volatile float led_level[2];       // For the E trace
+volatile uint32_t led_trace_until; // ms
 float          tone_phase[2];
 char           usb_cmd[32];
 uint32_t       usb_cmd_len;
@@ -438,6 +441,8 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             defaults_requested = true;
         } else if (c == 'L') {
             log_dump_requested = true;
+        } else if (c == 'E') {
+            led_trace_until = System::GetNow() + 15000;
         } else if (c == 'C') {
             calib_requested = true;
         } else if (c == 'Q') {
@@ -587,6 +592,25 @@ void HandleTransport()
 }
 
 
+// Recording: bright with a dip on every beat. Once its end is set (tap / power of two / preset
+// length) it counts down: in the last bar a dip on every beat (4-3-2-1); before that, at each bar
+// line, one short dip per bar still to go (up to 8).
+float RecordingLed(const ceres::Track& t, bool beat_flash)
+{
+    uint32_t end = t.EndTicks(), now = t.RecordedTicks();
+    if (end == 0 || end <= now)
+        return beat_flash ? 0.4f : 1.0f;
+    uint32_t left = (end - now + Clock::kTicksPerBar - 1) / Clock::kTicksPerBar;  // Bars to go, this one included
+    if (left <= 1)
+        return now % Clock::kTicksPerBeat < 6 ? 0.0f : 1.0f;  // Last bar: dark 1/16 on every beat
+    uint32_t in_bar = now % Clock::kTicksPerBar;
+    uint32_t dips   = left - 1 > 8 ? 8 : left - 1;  // Bars after this one
+    if (in_bar < dips * 12)
+        return in_bar % 12 < 6 ? 0.0f : 1.0f;  // 1/16 dark, 1/16 bright, per bar to go
+    return 1.0f;
+}
+
+
 // LED for a track: record = bright, overdub = fast blink, play = dim, armed = blink on the beat,
 // stop pending = blink dim; a dip on every beat (longer on bar 1). Empty: a faint beat flash.
 float TrackLed(const ceres::Track& t, uint32_t blocks)
@@ -598,7 +622,7 @@ float TrackLed(const ceres::Track& t, uint32_t blocks)
         case ceres::Track::EMPTY: return beat_flash ? (bar_one ? 0.3f : 0.1f) : 0.0f;
         case ceres::Track::ARMED:
         case ceres::Track::ARMED_PLAY: return tick < Clock::kTicksPerBeat / 2 ? 1.0f : 0.0f;
-        case ceres::Track::RECORDING: return beat_flash ? 0.4f : 1.0f;
+        case ceres::Track::RECORDING: return RecordingLed(t, beat_flash);
         case ceres::Track::OVERDUBBING: return (blocks / 60) & 1 ? 1.0f : 0.2f;
         case ceres::Track::PLAYING:
             if (t.StopPending())
@@ -795,8 +819,22 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
 
     // While learning (DIP 4 on) both LEDs breathe slowly over the track state
     float learn = controls.Learning() ? 0.5f + 0.5f * sinf(blocks * 0.004f) : 0.0f;
-    led1.Set(blocks < led_flash_until[0] ? 1.0f : fmaxf(TrackLed(tracks[0], blocks), learn));
-    led2.Set(blocks < led_flash_until[1] ? 1.0f : fmaxf(TrackLed(tracks[1], blocks), learn));
+    // MIDI clock lost, running on at its last tempo: both LEDs breathe slowly (2 s), over whatever
+    // they show; empty tracks get a faint glow so it's visible
+    bool  free_running = tempo_from_midi && !midi_sync.Locked();
+    float breath       = 0.5f + 0.5f * sinf(blocks * (2.0f * 3.14159265f / 2000.0f));
+    float l[2];
+    for (int t = 0; t < 2; t++) {
+        l[t] = fmaxf(TrackLed(tracks[t], blocks), learn);
+        if (free_running)
+            l[t] = fmaxf(l[t] * (0.35f + 0.65f * breath), 0.12f * breath);
+        if (blocks < led_flash_until[t])
+            l[t] = 1.0f;
+    }
+    led1.Set(l[0]);
+    led2.Set(l[1]);
+    led_level[0] = l[0];
+    led_level[1] = l[1];
     led1.Update();
     led2.Update();
     if (limiters[0].GainReduction() < 0.9f || limiters[1].GainReduction() < 0.9f)
@@ -1294,6 +1332,11 @@ int main(void)
                     tracks[t].LengthSamples(), System::GetNow() - start);
         }
         MonitorAndLog();
+        static uint32_t last_led;
+        if (System::GetNow() < led_trace_until && System::GetNow() - last_led >= 50) {
+            last_led = System::GetNow();
+            hw.seed.PrintLine("led %d %d", (int)(led_level[0] * 100.0f), (int)(led_level[1] * 100.0f));
+        }
         if (log_dump_requested)
             DumpLog();
 
