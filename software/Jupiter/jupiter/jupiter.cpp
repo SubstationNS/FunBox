@@ -537,8 +537,17 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
 
             reverb->Process(inL, inR, outL, outR, 1); 
             // Bears. Beets. Battlestar Galactica.
-            out[0][i] = inputL * dryMix + outL[0] * wetMix;
-            out[1][i] = inputR * dryMix + outR[0] * wetMix;
+            float leftOutput = inputL * dryMix + outL[0] * wetMix;
+            float rightOutput = inputR * dryMix + outR[0] * wetMix;
+
+            if (dipValues[1]) {  // Mono out: sum L+R to both outputs
+                float monoOutput = (leftOutput + rightOutput) * 0.5;
+                out[0][i] = monoOutput;
+                out[1][i] = monoOutput;
+            } else {
+                out[0][i] = leftOutput;
+                out[1][i] = rightOutput;
+            }
 
 
         }

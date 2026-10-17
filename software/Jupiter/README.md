@@ -20,7 +20,7 @@ but more EQ controls are exposed to the user, specifically the post reverb low a
 | 3-Way Switch 2 | Modulation Level  |  Sets the modulation amount and rate, low, medium, high  |
 | 3-Way Switch 3 | PreDelay | Sets predelay, 0, 100ms, 200ms | 
 | Dip Switch 1 | MISO/Stereo | MISO (Mono in stereo out), or True Stereo |
-| Dip Switch 2 |  |  |
+| Dip Switch 2 | Mono out | Turn on to sum L+R reverb to both outputs (for mono rigs) |
 | Dip Switch 3 |  |  |
 | Dip Switch 4 |  |  |
 | FS 1 | Bypass/Engage |  |
