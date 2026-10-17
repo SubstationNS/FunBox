@@ -1,2 +1,3 @@
 test/clock_test
 test/fx_render
+test/midi_test

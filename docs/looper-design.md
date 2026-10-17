@@ -65,7 +65,8 @@ since Start". Once ticks are lost, the pedal can't know where the bar is until t
 | Situation | What happens |
 | --- | --- |
 | Clock running | internal tempo tracks the smoothed tick period; phase is corrected by tiny playback-rate nudges, clamped to ±0.2 % (≈ 3.5 cents, inaudible) — later done through the stretcher, so pitch-neutral |
-| Clock jitter | averaged out over ~24 ticks; never causes a jump |
+| Clock jitter | averaged out over two bars of ticks; never causes a jump |
+| Master changes tempo | re-follows within ~half a second; while the tempo is moving the phase nudges may go to ±2 % (the loops can't follow a tempo change until the stretcher anyway) |
 | Clock disappears | nothing audible — internal clock continues at the last tempo and bar position; LED shows "free-running" |
 | Clock comes back | tempo re-tracks; only the sub-tick phase is gently corrected; **bar position is kept** |
 | `Stop` | loops fade out (~5 ms) and remember their position |
@@ -78,10 +79,25 @@ MIDI has no Pause message: a DAW/clock "pause" is `Stop` → (optional `SPP`) �
 Only loops stopped *by MIDI* auto-resume; a track you stopped with the footswitch stays stopped.
 Many clock sources also stop sending `0xF8` while stopped — the flywheel doesn't care.
 
+### Implementation (phase 1, `midi_sync.h`)
+- Ticks are timestamped in the UART interrupt (which may cut into the audio callback), back-dated
+  by the UART's idle-line delay, and parsed in the audio callback by our own parser (`midi_in.h`).
+- A least-squares line through the last 192 tick arrival times: slope = tempo, end of the line =
+  de-jittered phase. The clock gets that tempo; the phase error goes through the rate trim
+  (corrected over ~1.5 s, clamped ±0.2 %).
+- Tempo change detection: the newest 12 ticks are compared against the line through the older
+  ones; drift beyond 4.5σ of what jitter can explain restarts the fit from the recent ticks.
+- Ticks are counted, never inferred from timing, so bunched-up ticks can't shift the bar.
+- Start / Continue locate the clock on the next tick, using the fitted grid when the clock was
+  already running (a held-up first tick doesn't misplace bar 1).
+- Simulated worst case (USB-MIDI from a DAW: 1 ms σ jitter, 1 ms USB frames, 2 % of ticks held up
+  2–10 ms): ±0.6 ms around the average arrival delay, steady over an hour; no false tempo changes.
+
 ### Tempo knob
 - Range ~60–200 BPM, quantized to whole BPM with hysteresis, so pot noise can't wobble the tempo.
 - LED beat flash shows the tempo.
-- Ignored while a MIDI clock is present.
+- Ignored while a MIDI clock is present. When the clock goes away, the last MIDI tempo stays until
+  the knob is moved (pickup), so losing the clock stays inaudible.
 
 ### Tempo / bar tracking details
 - Timestamp each `0xF8` (audio sample counter + offset within the block, or DWT cycle counter).

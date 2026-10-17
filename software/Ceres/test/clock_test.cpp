@@ -45,10 +45,13 @@ static void TestBeatPositions(float bpm, uint64_t seconds)
             bars++;
     }
 
-    uint64_t expected_beats = (uint64_t)std::floor((total - 1) / samples_per_beat) + 1;
-    CHECK(beats == expected_beats, "%.1f BPM: %llu beats, expected %llu", bpm,
+    // Beats at times before the end; one landing exactly on the end may or may not be counted
+    double   end_in_beats   = total / samples_per_beat;
+    uint64_t expected_beats = (uint64_t)std::ceil(end_in_beats);
+    bool     on_the_end     = std::fabs(end_in_beats - std::round(end_in_beats)) < 1e-9;
+    CHECK(beats == expected_beats || (on_the_end && beats == expected_beats + 1), "%.1f BPM: %llu beats, expected %llu", bpm,
           (unsigned long long)beats, (unsigned long long)expected_beats);
-    // A beat may land up to one sample late (it's reported on the sample that crosses it)
+    // Sample n covers the time n..n+1, a beat is reported on the sample during which it falls
     CHECK(worst_error <= 1.0, "%.1f BPM: beat off by %.3f samples after %llus", bpm, worst_error,
           (unsigned long long)seconds);
     std::printf("  %6.1f BPM, %5llus: %llu beats, %llu bars, worst beat error %.3f samples\n", bpm,
