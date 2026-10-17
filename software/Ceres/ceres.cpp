@@ -9,6 +9,8 @@
 #include "track.h"
 #include "mixer.h"
 #include "updater.h"
+#include "params.h"
+#include "persist.h"
 
 //
 // Ceres - MIDI-synced dual-track bar looper for the Funbox v3.
@@ -22,6 +24,9 @@
 //   Knob 5: FX amount on the loops, 3-way 2: Tape / Delay / Repeat.
 //   3-way 1: grid for double-tap endings (1/4, 1/8, 1/16). 3-way 3: stop mode (now, end of bar, end of loop).
 //   DIP 1: split (In L / Out L = Track 1, In R / Out R = Track 2). DIP 2: power-of-two loop lengths.
+//   DIP 4: expression learn (on = state A, off = state B: the pedal morphs what differs).
+//   Knobs and the pedal use pickup; MIDI CC (map in the README) jumps. The settings are saved to
+//   QSPI 10 s after the last change and restored at power-up.
 //   Dry always passes at unity. Status over USB serial once per bar.
 //
 
@@ -62,7 +67,9 @@ static const char* kFxNames[] = {"tape", "delay", "repeat"};
 static const uint32_t kTapeBufSize   = 4096;    // ~85 ms, plenty for wow/flutter
 static const uint32_t kDelayBufSize  = 120000;  // 2.5 s: a 1/4 note at 24 BPM, dotted 1/8 at 60 has lots of room
 static const uint32_t kRepeatBufSize = 50000;   // 1.04 s: one beat at 60 BPM
-static const uint32_t kDelayTicks    = 18;      // Dotted 1/8 note (24 ticks per beat)
+// Delay time per MIDI CC 77: 1/4, dotted 1/8 (default), 1/8, 1/8 triplet, 1/16 (24 ticks per beat)
+static const uint32_t kDelayTicks[]  = {24, 18, 12, 8, 6};
+volatile uint8_t      delay_division = 1;
 
 float DSY_SDRAM_BSS tape_buf[2][kTapeBufSize];
 float DSY_SDRAM_BSS delay_buf[2][kDelayBufSize];
@@ -78,6 +85,18 @@ static const uint32_t kLoopCapacity = 3600000;
 static const uint32_t kSideSize     = 72000;  // 1.5 s, more than Track::kCancelSeconds
 float DSY_SDRAM_BSS loop_buf[2][2][kLoopCapacity];
 float DSY_SDRAM_BSS side_buf[2][2][kSideSize];
+
+// Parameters (pickup, CC, morph) and their saved state
+ceres::Controls      controls;
+ceres::SnapshotStore store;
+ceres::Snapshot      saved_snap, pending_snap;
+uint32_t             pending_since;
+volatile uint32_t    saves, save_failures;
+volatile uint8_t     preset_bars;        // MIDI CC 29
+volatile int8_t      grid_override = -1; // MIDI CC 30 (ticks), until 3-way 1 moves
+int8_t               grid_switch_last = -1;
+bool                 tempo_restored;
+uint32_t             led_flash_until[2];  // Block counter: takeover / learn flashes
 
 ceres::Track      tracks[2];
 ceres::Footswitch footswitch[2];
@@ -113,7 +132,10 @@ bool              split_mode;
 //   raw bytes 0xF8-0xFF are injected directly (clock, start, continue, stop), timestamped on arrival
 //   D<1-2>    footswitch 1 / 2 down, U<1-2> up (e.g. D1, U1: a tap)
 //   I<0-1>    test tone instead of the inputs: 220 Hz on In L, 330 Hz on In R (-10 dBFS)
-//   N         pin levels at unity and filters flat (the bare Seed's knobs float); K releases
+//   N         pin the knob and pedal readings (the bare Seed's knobs float): levels unity,
+//             filters flat, FX 0, pedal 0; K releases. X<k><vvv> sets pinned control k (0-4 =
+//             knobs 1, 3, 4, 6, 5; 5 = pedal) to vvv %, e.g. X0050. Y1 / Y0: DIP 4 on / off.
+//   R         restart (tests the saved state). Z: back to defaults (morph cleared, knobs apply)
 //   Q         check the QSPI chip, lift a write protection (see updater.h)
 volatile bool  bootloader_requested, daisy_bootloader_requested;
 
@@ -129,6 +151,9 @@ volatile bool  stress;
 volatile bool  fs_injected[2];
 volatile bool  test_tone;
 volatile bool  neutral_mix;
+float          pinned_raw[6] = {0.7071f, 0.7071f, 0.5f, 0.5f, 0.0f, 0.0f};  // N mode: knobs 1, 3, 4, 6, 5, pedal
+volatile bool  dip4_injected;
+volatile bool  reset_requested, defaults_requested;
 float          tone_phase[2];
 char           usb_cmd[32];
 uint32_t       usb_cmd_len;
@@ -212,6 +237,8 @@ void MidiUartReceive(uint8_t* data, size_t size, void*)
 }
 
 
+void HandleCc(uint8_t cc, uint8_t value);
+
 void HandleMidiMessage(const ceres::MidiMsg& m)
 {
     switch (m.type) {
@@ -235,7 +262,10 @@ void HandleMidiMessage(const ceres::MidiMsg& m)
             midi_spp++;
             midi_sync.OnSongPosition(m.value());
             break;
-        case ceres::MidiMsg::CC: midi_cc++; break;
+        case ceres::MidiMsg::CC:
+            midi_cc++;
+            HandleCc(m.data1, m.data2);
+            break;
         default: midi_other++; break;
     }
 }
@@ -262,6 +292,14 @@ void ProcessMidi(uint32_t block_time)
 // Clearing them hands the tempo back to knob 2 once it moves.
 void UpdateTempo(float knob)
 {
+    if (tempo_restored) {  // Saved tempo: knob 2 only takes over once it moves
+        static int settle;  // ...from where it really is: its reading ramps up from 0 at power-on
+        knob_has_tempo   = false;
+        knob_at_handover = knob;
+        if (++settle < ceres::Controls::kSettleBlocks)
+            return;
+        tempo_restored = false;
+    }
     bool loops = tracks[0].GetState() != ceres::Track::EMPTY || tracks[1].GetState() != ceres::Track::EMPTY;
     if (midi_sync.Locked() || loops) {
         knob_has_tempo   = false;
@@ -312,6 +350,11 @@ void RunUsbCommand(char cmd, int value)
                 fs_injected[value - 1] = cmd == 'D';
             break;
         case 'I': test_tone = value != 0; break;
+        case 'X':  // X<k><vvv>: pinned raw control k (0-4 knobs 1, 3, 4, 6, 5; 5 pedal) at vvv %
+            if (value / 1000 <= 5 && value % 1000 <= 100)
+                pinned_raw[value / 1000] = (value % 1000) / 100.0f;
+            break;
+        case 'Y': dip4_injected = value != 0; break;
     }
 }
 
@@ -353,9 +396,13 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             stress = !stress;
         } else if (c == 'N') {
             neutral_mix = true;
+        } else if (c == 'R') {
+            reset_requested = true;
+        } else if (c == 'Z') {
+            defaults_requested = true;
         } else if (c == 'Q') {
             qspi_probe_requested = true;
-        } else if (c == 'T' || c == 'F' || c == 'A' || c == 'M' || c == 'D' || c == 'U' || c == 'I') {
+        } else if (c == 'T' || c == 'F' || c == 'A' || c == 'M' || c == 'D' || c == 'U' || c == 'I' || c == 'X' || c == 'Y') {
             usb_cmd_len = 0;
             usb_cmd[usb_cmd_len++] = c;
         } else if (usb_cmd_len > 0 && c >= '0' && c <= '9' && usb_cmd_len < sizeof(usb_cmd) - 1) {
@@ -378,6 +425,15 @@ ceres::Track::Settings ReadTrackSettings()
                       : (hw.switches[Funbox::SWITCH_3_RIGHT].Pressed() ? ceres::Track::STOP_END_OF_LOOP
                                                                        : ceres::Track::STOP_END_OF_BAR);
     st.power_of_two = hw.switches[Funbox::SWITCH_DIP_2].Pressed();
+    // MIDI CC 30 overrides the grid toggle until the toggle moves
+    if (grid_switch_last != (int8_t)st.grid_ticks) {
+        if (grid_switch_last >= 0)
+            grid_override = -1;
+        grid_switch_last = (int8_t)st.grid_ticks;
+    }
+    if (grid_override > 0)
+        st.grid_ticks = (uint32_t)grid_override;
+    st.preset_bars = preset_bars;
     return st;
 }
 
@@ -393,6 +449,39 @@ void StopOrStartAll(const ceres::Track::Settings& st)
             t.RequestStop(st.stop_mode);
         else
             t.RequestPlay();
+    }
+}
+
+
+// MIDI CC map (omni). Buttons act when the value goes from below 64 to 64 or more.
+//   20 / 21  Track 1 / 2 tap (record / overdub / play)   22 / 23  stop (stop mode)
+//   24 / 25  undo / redo                                  26 / 27  clear
+//   28       stop all / start all                         29       preset length in bars (0 = off)
+//   30       grid: 0-42 1/4, 43-85 1/8, 86-127 1/16 (until 3-way 1 moves)
+//   7 / 8    Track 1 / 2 level      74 / 75  Track 1 / 2 filter      76  FX amount
+//   77       delay time: 1/4, dotted 1/8, 1/8, 1/8 triplet, 1/16 (value / 26)
+void HandleCc(uint8_t cc, uint8_t value)
+{
+    static uint8_t last[128];
+    bool pressed = value >= 64 && last[cc & 127] < 64;
+    last[cc & 127] = value;
+    float v = value / 127.0f;
+    ceres::Track::Settings st = ReadTrackSettings();
+    switch (cc) {
+        case 20: case 21: if (pressed) tracks[cc - 20].Tap(clock); break;
+        case 22: case 23: if (pressed) tracks[cc - 22].RequestStop(st.stop_mode); break;
+        case 24: case 25: if (pressed) tracks[cc - 24].Undo(); break;
+        case 26: case 27: if (pressed) tracks[cc - 26].Clear(); break;
+        case 28: if (pressed) StopOrStartAll(st); break;
+        case 29: preset_bars = value > 64 ? 64 : value; break;
+        case 30: grid_override = value < 43 ? 24 : (value < 86 ? 12 : 6); break;
+        case 7: controls.Cc(ceres::Controls::T1_LEVEL, v); break;
+        case 8: controls.Cc(ceres::Controls::T2_LEVEL, v); break;
+        case 74: controls.Cc(ceres::Controls::T1_FILTER, v); break;
+        case 75: controls.Cc(ceres::Controls::T2_FILTER, v); break;
+        case 76: controls.Cc(ceres::Controls::FX_AMOUNT, v); break;
+        case 77: delay_division = value / 26 > 4 ? 4 : value / 26; break;
+        default: break;
     }
 }
 
@@ -494,19 +583,49 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     HandleFootswitches(block_sample / clock_sample_rate, st);
     split_mode = hw.switches[Funbox::SWITCH_DIP_1].Pressed();
 
+    // Knobs 1, 3, 4, 6, 5 and the pedal into the parameters (pickup, morph)
+    float raw[ceres::Controls::kCount];
+    float pedal = hw.GetExpression();
+    raw[ceres::Controls::T1_LEVEL]  = level_knob[0].Process();
+    raw[ceres::Controls::T2_LEVEL]  = level_knob[1].Process();
+    raw[ceres::Controls::T1_FILTER] = filter_knob[0].Process();
+    raw[ceres::Controls::T2_FILTER] = filter_knob[1].Process();
+    raw[ceres::Controls::FX_AMOUNT] = fx_knob.Process();
+    if (neutral_mix) {
+        for (int k = 0; k < ceres::Controls::kCount; k++)
+            raw[k] = pinned_raw[k];
+        pedal = pinned_raw[5];
+    }
+    if (defaults_requested) {
+        defaults_requested = false;
+        controls.Init(nullptr, nullptr);
+        delay_division = 1;
+        preset_bars    = 0;
+    }
+    uint16_t cev = controls.Update(raw, pedal, hw.switches[Funbox::SWITCH_DIP_4].Pressed() || dip4_injected);
+    // LED feedback: a short flash on the track a control just took over; both for learn A / B
+    if (cev & (ceres::Controls::TAKEOVER_T1 | ceres::Controls::TAKEOVER_FX))
+        led_flash_until[0] = blocks + 80;
+    if (cev & (ceres::Controls::TAKEOVER_T2 | ceres::Controls::TAKEOVER_FX))
+        led_flash_until[1] = blocks + 80;
+    if (cev & (ceres::Controls::LEARN_A | ceres::Controls::LEARN_B))
+        led_flash_until[0] = led_flash_until[1] = blocks + 400;
+    if (cev & ceres::Controls::MORPH_CLEARED)
+        led_flash_until[0] = led_flash_until[1] = blocks + 150;
+
     int   fx     = fx_override >= 0 ? (int)fx_override : ReadFxSwitch();
-    float amount = amount_override >= 0.0f ? (float)amount_override : fx_knob.Process();
+    float amount = amount_override >= 0.0f ? (float)amount_override : controls.Value(ceres::Controls::FX_AMOUNT);
     current_fx     = fx;
     current_amount = amount;
 
-    float delay_time = (float)(kDelayTicks * clock.SamplesPerTickNominal());
+    float delay_time = (float)(kDelayTicks[delay_division] * clock.SamplesPerTickNominal());
     delay_fx[0].SetTime(delay_time);
     delay_fx[1].SetTime(delay_time);
 
     float level[2];
     for (int t = 0; t < 2; t++) {
-        level[t] = ceres::LevelGain(neutral_mix ? 0.7071f : level_knob[t].Process());
-        filters[t].SetKnob(neutral_mix ? 0.5f : filter_knob[t].Process());
+        level[t] = ceres::LevelGain(controls.Value((ceres::Controls::Id)(ceres::Controls::T1_LEVEL + t)));
+        filters[t].SetKnob(controls.Value((ceres::Controls::Id)(ceres::Controls::T1_FILTER + t)));
         tracks[t].BeginBlock(clock, st, midi_sync.Playing());
     }
 
@@ -565,8 +684,10 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
             out[1][i] = out[0][i];
     }
 
-    led1.Set(TrackLed(tracks[0], blocks));
-    led2.Set(TrackLed(tracks[1], blocks));
+    // While learning (DIP 4 on) both LEDs breathe slowly over the track state
+    float learn = controls.Learning() ? 0.5f + 0.5f * sinf(blocks * 0.004f) : 0.0f;
+    led1.Set(blocks < led_flash_until[0] ? 1.0f : fmaxf(TrackLed(tracks[0], blocks), learn));
+    led2.Set(blocks < led_flash_until[1] ? 1.0f : fmaxf(TrackLed(tracks[1], blocks), learn));
     led1.Update();
     led2.Update();
 
@@ -623,12 +744,96 @@ void PrintStatus()
     FormatTrack(t1, sizeof(t1), 0);
     FormatTrack(t2, sizeof(t2), 1);
     hw.seed.PrintLine("  %s | %s | %s", t1, t2, split_mode ? "split" : "mono");
+    // Parameters: value in %, owner (- restored, k knob, p pedal, c MIDI CC)
+    static const char kOwner[] = {'-', 'k', 'p', 'c'};
+    char params[96];
+    int  n = 0;
+    static const char* kNames[] = {"L1", "L2", "F1", "F2", "FX"};
+    for (int i = 0; i < ceres::Controls::kCount; i++)
+        n += snprintf(params + n, sizeof(params) - n, "%s %d%c ", kNames[i],
+                      (int)roundf(controls.Value((ceres::Controls::Id)i) * 100.0f), kOwner[controls.GetOwner((ceres::Controls::Id)i)]);
+    const ceres::Controls::Morph& mo = controls.GetMorph();
+    hw.seed.PrintLine("  %smorph %s%02x%s  delay /%lu  preset %d  saves %lu%s", params, mo.valid ? "" : "off ",
+                      mo.mask, controls.Learning() ? " LEARNING" : "", kDelayTicks[delay_division], (int)preset_bars, saves,
+                      save_failures ? " (failures!)" : "");
     hw.seed.PrintLine("  fx %s%s %d%%  cpu %d/%d%%  midi clk %lu start %lu cont %lu stop %lu spp %lu cc %lu other %lu drop %lu uart %lu",
                       stress ? "STRESS " : "", kFxNames[current_fx], (int)(current_amount * 100.0f),
                       (int)(cpu_meter.GetAvgCpuLoad() * 100.0f), (int)(cpu_meter.GetMaxCpuLoad() * 100.0f),
                       midi_ticks, midi_starts, midi_continues, midi_stops, midi_spp, midi_cc, midi_other,
                       midi_dropped, uart_restarts);
     cpu_meter.Reset();  // Max per bar
+}
+
+
+// Snapshot slots: the top 16 KB of the 8 MB QSPI chip, far above the program
+class QspiSnapshotFlash : public ceres::SnapshotFlash
+{
+  public:
+    static const uint32_t kBase = 0x7FC000;
+
+    const uint8_t* Read(uint32_t slot) override
+    {
+        uint8_t* p = (uint8_t*)hw.seed.qspi.GetData(kBase + slot * 4096);
+        dsy_dma_invalidate_cache_for_buffer(p, 4096);
+        return p;
+    }
+
+    bool Write(uint32_t slot, const uint8_t* data, uint32_t size) override
+    {
+        uint32_t addr = 0x90000000 + kBase + slot * 4096;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (hw.seed.qspi.Erase(addr, addr + 4096) == QSPIHandle::Result::OK
+                && hw.seed.qspi.Write(addr, size, (uint8_t*)data) == QSPIHandle::Result::OK)
+                return memcmp(Read(slot), data, size) == 0;
+            updater.Unprotect(false);  // The chip may have been locked (see updater.h); once more
+        }
+        return false;
+    }
+};
+QspiSnapshotFlash snapshot_flash;
+
+
+// What would be saved right now
+ceres::Snapshot CurrentSettings()
+{
+    ceres::Snapshot snap;
+    memset(&snap, 0, sizeof(snap));
+    for (int i = 0; i < ceres::Controls::kCount; i++)
+        snap.values[i] = controls.Value((ceres::Controls::Id)i);
+    snap.tempo          = clock.Tempo();
+    snap.delay_division = delay_division;
+    snap.preset_bars    = preset_bars;
+    snap.morph          = controls.GetMorph();
+    return snap;
+}
+
+
+// Main loop, every 100 ms: save 10 s after the last change (one write per change, however long
+// a knob is swept). Not while learning: the morph isn't finished.
+void SaveWhenSettled()
+{
+    static uint32_t last_check;
+    uint32_t now = System::GetNow();
+    if (now - last_check < 100)
+        return;
+    last_check = now;
+    ceres::Snapshot snap = CurrentSettings();
+    if (!snap.SameAs(pending_snap, 0.005f)) {
+        pending_snap  = snap;
+        pending_since = now;
+        return;
+    }
+    if (snap.SameAs(saved_snap, 0.005f) || now - pending_since < 10000 || controls.Learning())
+        return;
+    if (store.Save(snap)) {
+        saved_snap = snap;
+        saves++;
+        hw.seed.PrintLine("saved settings (#%lu)", snap.sequence);
+    } else {
+        saved_snap = snap;  // Don't retry every 100 ms
+        save_failures++;
+        hw.seed.PrintLine("saving settings FAILED");
+    }
 }
 
 
@@ -656,6 +861,23 @@ int main(void)
         sample_rate = kTrueSampleRate48k;
     clock.Init(sample_rate, 120.0f);
     clock_sample_rate = sample_rate;
+
+    // Saved settings: values stay until a control takes over by pickup; nothing saved: defaults
+    store.Init(&snapshot_flash);
+    ceres::Snapshot restored;
+    bool have_snapshot = store.Load(restored);
+    if (have_snapshot) {
+        controls.Init(restored.values, &restored.morph);
+        clock.SetTempo(restored.tempo >= kMinBpm && restored.tempo <= kMaxBpm ? restored.tempo : 120.0f);
+        tempo_restored = true;
+        delay_division = restored.delay_division <= 4 ? restored.delay_division : 1;
+        preset_bars    = restored.preset_bars;
+        saved_snap     = restored;
+    } else {
+        controls.Init(nullptr, nullptr);
+        memset(&saved_snap, 0, sizeof(saved_snap));
+    }
+    pending_snap = saved_snap;
 
     for (int t = 0; t < 2; t++) {
         tracks[t].Init(sample_rate, loop_buf[t][0], loop_buf[t][1], kLoopCapacity, side_buf[t][0], side_buf[t][1], kSideSize);
@@ -694,6 +916,10 @@ int main(void)
     HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);  // SAI1 B
 
     hw.seed.PrintLine("Ceres: two tracks, MIDI clock sync, loop FX");
+    if (have_snapshot)
+        hw.seed.PrintLine("restored settings #%lu (%d BPM)", restored.sequence, (int)restored.tempo);
+    else
+        hw.seed.PrintLine("no saved settings, defaults");
 
     while (1)
     {
@@ -710,6 +936,10 @@ int main(void)
 
         if (updater.Pending())
             updater.Run();
+        if (reset_requested)
+            NVIC_SystemReset();
+        if (!updater.Pending())
+            SaveWhenSettled();
         if (qspi_probe_requested) {
             qspi_probe_requested = false;
             updater.Unprotect(false);

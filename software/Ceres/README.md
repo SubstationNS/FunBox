@@ -1,8 +1,8 @@
 # Ceres
 MIDI-synced dual-track bar looper. Design: [docs/looper-design.md](../../docs/looper-design.md)
 
-Status: **two tracks, MIDI clock sync, loop FX** (design phases 1–5, minus the MIDI CC map).
-Still to come: expression morph + saved state, then time-stretch.
+Status: **two tracks, MIDI clock sync + CC, loop FX, expression morph, saved settings** (design
+phases 1–6). Still to come: time-stretch, then the "maybe later" list.
 
 ## Build and flash
 
@@ -47,6 +47,8 @@ register locked while WP# is low), so every erase failed, including the Daisy bo
 | 3-way 3 | Stop mode: now / end of bar / end of loop |
 | DIP 1 | Split: In L → Track 1 → Out L, In R → Track 2 → Out R. Off: In L feeds both, both outs the same |
 | DIP 2 | Loop lengths round up to 1, 2, 4, 8, 16 ... bars |
+| DIP 4 | Expression learn: on = state A, off = state B (see below) |
+| Expression | Morphs between state A and B |
 | MIDI in | Clock sets tempo and phase; Start = bar 1, Stop / Song Position / Continue like a DAW |
 
 Per footswitch:
@@ -64,6 +66,34 @@ Per footswitch:
 - Overdubs can be taken back for 1.2 s (double tap / hold), without losing the previous undo.
 - Dry always passes at unity; loops (and the FX) are added; a limiter catches hot stacks.
 - Loop memory: 75 s per track.
+
+### Knobs, expression pedal, saved settings
+
+- Settings are saved 10 s after the last change and come back at power-up (levels, filters, FX
+  amount, tempo, the values set by MIDI CC, the expression morph). Loops aren't saved.
+- After power-up a knob does nothing until you turn it, and then only takes over once it passes
+  the saved value (pickup, the LED flashes when it does). The toggles and DIPs always apply as set.
+- Expression morph: set the sound you want at one end and put the pedal there, **DIP 4 on**
+  (A, both LEDs flash, then breathe), move the knobs and the pedal to the other end's sound,
+  **DIP 4 off** (B, both LEDs flash). Whatever differs between A and B now follows the pedal, any
+  part of its travel. Knob 2 (tempo) is never part of it. DIP 4 on and off with no change in
+  between clears the morph.
+- A knob and the pedal share the parameters they both control by pickup: whichever crosses the
+  current value last owns it, so nothing ever jumps.
+
+### MIDI CC (any channel)
+
+| CC | Function | CC | Function |
+| --- | --- | --- | --- |
+| 20 / 21 | Track 1 / 2 tap | 7 / 8 | Track 1 / 2 level |
+| 22 / 23 | Track 1 / 2 stop | 74 / 75 | Track 1 / 2 filter |
+| 24 / 25 | Track 1 / 2 undo / redo | 76 | FX amount |
+| 26 / 27 | Track 1 / 2 clear | 77 | Delay time: 1/4, dotted 1/8, 1/8, 1/8 triplet, 1/16 |
+| 28 | Stop all / start all | 29 | Recordings end by themselves after N bars (0 = off) |
+| 30 | Grid 1/4, 1/8, 1/16 (until 3-way 1 moves) | | |
+
+Buttons (20-28) act when the value goes to 64 or more. CC values jump (no pickup): a CC is a
+deliberate value, and DAW automation has to apply right away.
 
 LEDs: recording = bright, overdub = fast blink, playing = dim with a dip on every beat (longer on
 bar 1), armed = blinks on the beat, stopping = dim blink, stopped = faint glow, empty = faint beat flash.
@@ -101,7 +131,9 @@ and prints the status lines.
 Dev commands over USB serial (`tio /dev/ttyACM0`): `T<bpm>` pins the tempo, `F<0-2>` the FX
 (tape/delay/repeat), `A<0-100>` the FX amount, `S` toggles a stress test (all three FX in series),
 `K` hands everything back to the controls, `B` reboots into the STM32 ROM bootloader (DFU),
-`W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip. MIDI injection: raw bytes
+`W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip.
+`X<k><vvv>` / `Y1` `Y0` pin knob / pedal readings and DIP 4 (after `N`), `R` restarts, `Z` resets the
+settings to defaults. `test/params_inject.py` tests pickup, the morph, MIDI CC and saving with them. MIDI injection: raw bytes
 0xF8-0xFF (clock, Start, Continue, Stop) and `M<hex>` (e.g. `Mf20001` = Song Position bar 9) go
 into the MIDI input as if they came from the jack. `D1`/`U1` (`D2`/`U2`) press and release a
 footswitch, `I1`/`I0` a test tone on the inputs, `N` pins levels to unity and filters flat (the bare
@@ -134,6 +166,12 @@ Tracks and footswitch gestures (recording lengths, snapping, power of two, grid 
 overdub / undo / redo / cancel, stop modes, following a nudged clock, other tempos, MIDI transport):
 ```
 c++ -std=c++17 -O2 -I.. track_test.cpp -o track_test && ./track_test
+```
+
+Parameters and saved settings (pickup, power-on, MIDI CC, A/B morph, snapshot slots with power
+cuts and old layouts):
+```
+c++ -std=c++17 -O2 -I.. params_test.cpp -o params_test && ./params_test
 ```
 
 FX demo: renders a plucked riff through each FX (same code as the pedal) to WAV files:

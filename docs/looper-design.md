@@ -242,6 +242,15 @@ Power-on restores the last state; physical controls only take over once *moved*.
   audio interrupt — fine as long as the audio path never reads QSPI-mapped memory. MIDI bytes are
   buffered by UART DMA meanwhile, which is one more reason clock ticks are timestamped on arrival, not in the main loop.
 
+### Implementation notes (`params.h`, `persist.h`)
+- A source that loses a parameter has to move past the threshold again before it can take it
+  back, so a knob resting where the pedal's morph passes by doesn't grab it.
+- Knob readings ramp up from 0 at power-on (libDaisy's smoothing): they're ignored for 200 ms,
+  otherwise the ramp would "cross" every saved value below the knob.
+- MIDI CC jumps instead of picking up (deliberate values; DAW automation).
+- Snapshot slots: top 16 KB of QSPI (0x907FC000), 4 x 4 KB, newest valid sequence wins.
+- While DIP 4 is on, the morph is off; saving waits until the learn is finished.
+
 ## Loop FX (3-way 2 + knob 5)
 
 Applied to the loops only (dry stays clean), one instance per output so split mode keeps guitar and bass apart.

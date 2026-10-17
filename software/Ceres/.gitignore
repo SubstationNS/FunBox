@@ -3,3 +3,4 @@ test/fx_render
 test/midi_test
 test/track_test
 loader/build/
+test/params_test

@@ -55,6 +55,7 @@ class Track
         uint32_t grid_ticks   = 12;        // Double-tap ending step: 24 (1/4), 12 (1/8), 6 (1/16)
         bool     power_of_two = false;     // Tap ending rounds up to 1, 2, 4, 8, ... bars
         StopMode stop_mode    = STOP_NOW;
+        uint32_t preset_bars  = 0;         // Recordings end by themselves after this many bars (0 = off)
     };
 
     static constexpr float  kFadeSeconds   = 0.005f;  // Seams, start/stop, punch in/out
@@ -489,6 +490,8 @@ class Track
         rec_ticks_ = 0;
         end_ticks_ = 0;
         anchor_    = (int64_t)clock.Tick();
+        if (settings_.preset_bars > 0)
+            end_ticks_ = settings_.preset_bars * kTicksPerBar;
         alt_valid_ = false;
         undone_    = false;
         job_       = NONE;
