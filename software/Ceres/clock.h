@@ -83,6 +83,7 @@ class Clock
     uint32_t Bar() const { return tick_ / kTicksPerBar; }                 // 0-based
     uint32_t BeatInBar() const { return (tick_ / kTicksPerBeat) % kBeatsPerBar; }  // 0-based
     uint32_t TickInBeat() const { return tick_ % kTicksPerBeat; }
+    double   SamplesPerTick() const { return 1.0 / increment_; }
 
   private:
     void UpdateIncrement()

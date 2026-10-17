@@ -26,7 +26,7 @@ echo "$out" | tail -n 4
 echo "$out" | grep -q "File downloaded successfully"
 
 # Wait for the new firmware's USB serial port, so a serial reader right after this finds it
-for _ in $(seq 50); do
+for _ in $(seq 150); do
     for t in /dev/serial/by-id/*Daisy*; do [ -e "$t" ] && echo "Running: $t" && exit 0; done
     sleep 0.1
 done
