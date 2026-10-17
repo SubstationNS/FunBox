@@ -147,6 +147,28 @@ both footswitches tap --> stop all / start all
 
 Overdub is classic: the existing loop is kept at full level, new input is added.
 
+### Implementation notes (`track.h`, `footswitch.h`)
+- A tap acts the moment the switch goes down (instant punch-in). If it turns out to be the first
+  half of a double tap, a hold or a both-footswitch press, its action is taken back.
+- Undo: two buffers per track (playing + undo/redo). An overdub writes in place; for its first
+  1.2 s the samples it overwrites go to a side buffer, so a double tap or a hold can cancel it
+  without touching the previous undo point (hold-to-undo always starts with a press, which starts
+  an overdub). After that it's committed and the pre-overdub loop is copied to the undo buffer in
+  the background, ahead of the playhead. Undo / redo = swap the buffers, with a crossfade.
+- Overdubs are written 2 samples behind the playhead, outside the interpolator's read window.
+- Playback follows the clock: position pulled toward where the clock says the loop is (±0.2 %),
+  crossfaded jump if more than 10 ms off. Tempo more than 0.6 % off the recorded one: the loop
+  plays at its own speed and restarts on every loop boundary (until the stretcher exists).
+- Decisions made while building:
+  - Tap while armed cancels; tap while a stop is pending keeps playing.
+  - A tap up to 80 ms (and at most a quarter of the step) after a boundary ends the loop on it.
+  - MIDI Stop pauses playing loops only; an armed track waits for the transport to play, a
+    recording carries on on the free-running clock.
+  - Hold 1 s while armed or recording discards the take.
+  - Tempo knob is locked while any track has a loop (picks back up once moved after clearing).
+- Still open: input latency compensation (needs a measurement on the FunBox), the MIDI CC map,
+  the LED countdown for power-of-two endings, the "free-running" LED pulse.
+
 ## Signal flow (dual mono)
 
 ```
