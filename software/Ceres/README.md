@@ -6,11 +6,24 @@ Still to come: expression morph + saved state, then time-stretch.
 
 ## Build and flash
 
-Hold BOOT, tap RESET on the Daisy, then:
+Ceres runs from RAM (480 KB for code instead of the 128 KB internal flash) and lives in the Seed's
+QSPI flash; the Daisy bootloader loads it at power-up (`APP_TYPE = BOOT_SRAM`).
+
 ```
-make
-make program-dfu
+./flash.sh             # build, send to the running Ceres over USB serial; it writes itself to QSPI and restarts
+./flash.sh --install   # first time / recovery: loader -> Ceres into QSPI -> Daisy bootloader
 ```
+
+No buttons and no DFU for normal updates: Ceres takes the new image over USB serial (`update.py`),
+checks its CRC, writes it to QSPI, reads it back and restarts. `--install` goes through the STM32's
+ROM bootloader. It gets there by itself from a running Ceres or loader; if nothing runs (a broken
+build), hold BOOT, tap RESET, release BOOT, then run it. The small loader (`loader/`) sits in
+internal flash only during the install, so Ceres can grow past 128 KB.
+
+The QSPI chip on this Seed was write-protected (status register `0xBA`: block protection on, status
+register locked while WP# is low), so every erase failed, including the Daisy bootloader's own DFU.
+`updater.h` lifts that before writing (drives WP# high, writes the status register back to `0x40`);
+`Q` over USB serial checks it.
 
 ## Controls
 
@@ -85,13 +98,10 @@ MIDI over USB, without a cable: `test/midi_inject.py` plays a MIDI clock into th
 USB serial port (lock from a wrong tempo, Start, Stop/SPP/Continue, a tempo step, a pulled cable)
 and prints the status lines.
 
-## Flashing without BOOT/RESET
-
-Once Ceres is on the Seed, `./flash.sh` builds, reboots the Seed into DFU over USB serial and flashes.
-
 Dev commands over USB serial (`tio /dev/ttyACM0`): `T<bpm>` pins the tempo, `F<0-2>` the FX
 (tape/delay/repeat), `A<0-100>` the FX amount, `S` toggles a stress test (all three FX in series),
-`K` hands everything back to the controls, `B` reboots into DFU. MIDI injection: raw bytes
+`K` hands everything back to the controls, `B` reboots into the STM32 ROM bootloader (DFU),
+`W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip. MIDI injection: raw bytes
 0xF8-0xFF (clock, Start, Continue, Stop) and `M<hex>` (e.g. `Mf20001` = Song Position bar 9) go
 into the MIDI input as if they came from the jack. `D1`/`U1` (`D2`/`U2`) press and release a
 footswitch, `I1`/`I0` a test tone on the inputs, `N` pins levels to unity and filters flat (the bare

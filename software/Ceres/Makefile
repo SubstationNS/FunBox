@@ -1,7 +1,9 @@
 # Project Name
 TARGET = ceres
 
-#APP_TYPE = BOOT_SRAM
+# Runs from RAM, stored in the QSPI flash by the Daisy bootloader (480 KB instead of 128 KB).
+# One-time setup: ./flash.sh --install
+APP_TYPE = BOOT_SRAM
 
 # Compiler options
 OPT=-Os

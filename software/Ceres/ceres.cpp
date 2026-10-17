@@ -8,6 +8,7 @@
 #include "footswitch.h"
 #include "track.h"
 #include "mixer.h"
+#include "updater.h"
 
 //
 // Ceres - MIDI-synced dual-track bar looper for the Funbox v3.
@@ -98,7 +99,11 @@ uint32_t          track_count;
 bool              split_mode;
 
 // Dev commands over USB serial (letter + number + newline, except B/K/S):
-//   B         reboot into the DFU bootloader (used by flash.sh)
+//   B         reboot into the STM32's ROM DFU bootloader (flash.sh, to install the Daisy bootloader)
+//   b         reboot into the Daisy bootloader's DFU, waiting until flashed
+//   W<size>,<crc32>\n + <size> raw bytes (hex numbers): firmware update. The image (a BOOT_SRAM
+//             build) is written to QSPI where the Daisy bootloader loads it from, then Ceres
+//             restarts into it. Used by flash.sh; doesn't need the bootloader's DFU mode.
 //   T<bpm>    pin the tempo, ignoring knob 2 (e.g. T120); MIDI clock still wins
 //   K         hand tempo, FX type and amount back to the controls
 //   F<0-2>    pin the FX type: 0 tape, 1 delay, 2 repeat
@@ -109,7 +114,13 @@ bool              split_mode;
 //   D<1-2>    footswitch 1 / 2 down, U<1-2> up (e.g. D1, U1: a tap)
 //   I<0-1>    test tone instead of the inputs: 220 Hz on In L, 330 Hz on In R (-10 dBFS)
 //   N         pin levels at unity and filters flat (the bare Seed's knobs float); K releases
-volatile bool  bootloader_requested;
+//   Q         check the QSPI chip, lift a write protection (see updater.h)
+volatile bool  bootloader_requested, daisy_bootloader_requested;
+
+// Firmware update over USB serial (updater.h); the image collects in SDRAM
+uint8_t DSY_SDRAM_BSS  update_buf[ceres::FirmwareUpdater::kMaxSize];
+ceres::FirmwareUpdater updater;
+volatile bool          qspi_probe_requested;
 volatile float tempo_override;    // 0 = use knob 2
 volatile bool  tempo_override_new;
 volatile int   fx_override = -1;  // -1 = use 3-way 2
@@ -316,6 +327,8 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
     uint32_t now = System::GetTick();
     for (uint32_t i = 0; i < *len; i++) {
         char c = buf[i];
+        if (updater.Receive((uint8_t)c))  // W command and firmware image bytes
+            continue;
         if ((uint8_t)c >= 0xF8) {
             QueueMidiByte((uint8_t)c, now);  // Realtime MIDI, for testing without a MIDI cable
         } else if (usb_cmd_len > 0 && usb_cmd[0] == 'M' && HexDigit(c) >= 0) {
@@ -327,6 +340,8 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             usb_cmd_len = 0;
         } else if (c == 'B') {
             bootloader_requested = true;
+        } else if (c == 'b') {
+            daisy_bootloader_requested = true;
         } else if (c == 'K') {
             tempo_override  = 0.0f;
             knob_has_tempo  = true;
@@ -338,6 +353,8 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             stress = !stress;
         } else if (c == 'N') {
             neutral_mix = true;
+        } else if (c == 'Q') {
+            qspi_probe_requested = true;
         } else if (c == 'T' || c == 'F' || c == 'A' || c == 'M' || c == 'D' || c == 'U' || c == 'I') {
             usb_cmd_len = 0;
             usb_cmd[usb_cmd_len++] = c;
@@ -666,6 +683,8 @@ int main(void)
     midi_uart.Init(midi_config);
     midi_uart.StartRx(MidiUartReceive, nullptr);
 
+    updater.Init(&hw.seed, update_buf);
+
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
 
@@ -680,11 +699,20 @@ int main(void)
     {
         if (bootloader_requested)
             System::ResetToBootloader();  // STM32 DFU, no BOOT button needed
+        if (daisy_bootloader_requested)  // Daisy bootloader, stays in DFU until something is flashed
+            System::ResetToBootloader(System::BootloaderMode::DAISY_INFINITE_TIMEOUT);
 
         // The UART stops listening after an error (e.g. a framing error from a loose cable)
         if (!midi_uart.RxActive()) {
             uart_restarts++;
             midi_uart.StartRx(MidiUartReceive, nullptr);
+        }
+
+        if (updater.Pending())
+            updater.Run();
+        if (qspi_probe_requested) {
+            qspi_probe_requested = false;
+            updater.Unprotect(false);
         }
 
         if (bar_print_pending) {
