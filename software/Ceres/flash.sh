@@ -51,7 +51,7 @@ rom_dfu_present() {
 rom_dfu() {
     if ! rom_dfu_present; then
         if tty=$(serial_port); then
-            printf 'B' > "$tty"
+            printf 'B\n' > "$tty"
         else
             echo "Waiting for the ROM bootloader: hold BOOT, tap RESET, release BOOT (90 s)"
         fi

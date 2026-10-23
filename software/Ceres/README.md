@@ -163,7 +163,8 @@ MIDI over USB, without a cable: `test/midi_inject.py` plays a MIDI clock into th
 USB serial port (lock from a wrong tempo, Start, Stop/SPP/Continue, a tempo step, a pulled cable)
 and prints the status lines.
 
-Dev commands over USB serial (`tio /dev/ttyACM0`): `T<bpm>` pins the tempo, `F<0-2>` the FX
+Dev commands over USB serial (`tio /dev/ttyACM0`), each on a line of its own (Enter after it;
+anything else on the line voids it, so a terminal echoing the status text back can't trigger one): `T<bpm>` pins the tempo, `F<0-2>` the FX
 (tape/delay/repeat), `A<0-100>` the FX amount, `S` toggles a stress test (all three FX in series),
 `K` hands everything back to the controls, `B` reboots into the STM32 ROM bootloader (DFU),
 `W<size>,<crc>` + image is the firmware update (`update.py`), `Q` checks / unprotects the QSPI chip.

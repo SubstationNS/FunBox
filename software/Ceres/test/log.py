@@ -21,7 +21,7 @@ termios.tcsetattr(fd, termios.TCSANOW, a)
 buf, end = b"", time.time() + 10
 while time.time() < end and b"\n" not in buf:
     buf += os.read(fd, 4096)
-os.write(fd, b"L")
+os.write(fd, b"L\n")
 
 lines, buf, started, end = [], b"", False, time.time() + 30
 while time.time() < end:

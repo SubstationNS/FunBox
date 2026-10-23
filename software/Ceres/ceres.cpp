@@ -152,7 +152,8 @@ float             track_sum[2];
 uint32_t          track_count;
 bool              split_mode;
 
-// Dev commands over USB serial (letter + number + newline, except B/K/S):
+// Dev commands over USB serial, each on a line of its own (letter [+ number] + newline). Anything
+// else on the line voids it, so text echoed back by a terminal ("BPM", "bar") does nothing:
 //   B         reboot into the STM32's ROM DFU bootloader (flash.sh, to install the Daisy bootloader)
 //   b         reboot into the Daisy bootloader's DFU, waiting until flashed
 //   W<size>,<crc32>\n + <size> raw bytes (hex numbers): firmware update. The image (a BOOT_SRAM
@@ -196,6 +197,7 @@ volatile uint32_t led_trace_until; // ms
 float          tone_phase[2];
 char           usb_cmd[32];
 uint32_t       usb_cmd_len;
+bool           usb_line_ok = true;  // Nothing but a command on this line so far
 
 // MIDI in. The UART interrupt timestamps every byte (timer ticks) and queues it, the audio
 // callback parses them and steers the clock before it runs the block.
@@ -409,6 +411,45 @@ static int HexDigit(char c)
 }
 
 
+// One complete command line (see the list above)
+void RunUsbLine(uint32_t now)
+{
+    char c = usb_cmd[0];
+    if (c == 'M') {
+        for (uint32_t n = 1; n + 1 < usb_cmd_len; n += 2)
+            QueueMidiByte((uint8_t)(HexDigit(usb_cmd[n]) * 16 + HexDigit(usb_cmd[n + 1])), now);
+        return;
+    }
+    if (strchr("TFADUIXY", c)) {
+        if (usb_cmd_len > 1)
+            RunUsbCommand(c, atoi(&usb_cmd[1]));
+        return;
+    }
+    if (usb_cmd_len != 1)
+        return;
+    switch (c) {
+        case 'B': bootloader_requested = true; break;
+        case 'b': daisy_bootloader_requested = true; break;
+        case 'K':
+            tempo_override  = 0.0f;
+            knob_has_tempo  = true;
+            tempo_from_midi = false;
+            fx_override     = -1;
+            amount_override = -1.0f;
+            neutral_mix     = false;
+            break;
+        case 'S': stress = !stress; break;
+        case 'N': neutral_mix = true; break;
+        case 'R': reset_requested = true; break;
+        case 'Z': defaults_requested = true; break;
+        case 'L': log_dump_requested = true; break;
+        case 'E': led_trace_until = System::GetNow() + 15000; break;
+        case 'C': calib_requested = true; break;
+        case 'Q': qspi_probe_requested = true; break;
+    }
+}
+
+
 void UsbReceive(uint8_t* buf, uint32_t* len)
 {
     uint32_t now = System::GetTick();
@@ -418,49 +459,31 @@ void UsbReceive(uint8_t* buf, uint32_t* len)
             continue;
         if ((uint8_t)c >= 0xF8) {
             QueueMidiByte((uint8_t)c, now);  // Realtime MIDI, for testing without a MIDI cable
-        } else if (usb_cmd_len > 0 && usb_cmd[0] == 'M' && HexDigit(c) >= 0) {
-            if (usb_cmd_len < sizeof(usb_cmd) - 1)
-                usb_cmd[usb_cmd_len++] = c;
-        } else if (usb_cmd_len > 0 && usb_cmd[0] == 'M' && (c == '\n' || c == '\r')) {
-            for (uint32_t n = 1; n + 1 < usb_cmd_len; n += 2)
-                QueueMidiByte((uint8_t)(HexDigit(usb_cmd[n]) * 16 + HexDigit(usb_cmd[n + 1])), now);
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
+            if (usb_line_ok && usb_cmd_len > 0) {
+                usb_cmd[usb_cmd_len] = 0;
+                RunUsbLine(now);
+            }
             usb_cmd_len = 0;
-        } else if (c == 'B') {
-            bootloader_requested = true;
-        } else if (c == 'b') {
-            daisy_bootloader_requested = true;
-        } else if (c == 'K') {
-            tempo_override  = 0.0f;
-            knob_has_tempo  = true;
-            tempo_from_midi = false;
-            fx_override     = -1;
-            amount_override = -1.0f;
-            neutral_mix     = false;
-        } else if (c == 'S') {
-            stress = !stress;
-        } else if (c == 'N') {
-            neutral_mix = true;
-        } else if (c == 'R') {
-            reset_requested = true;
-        } else if (c == 'Z') {
-            defaults_requested = true;
-        } else if (c == 'L') {
-            log_dump_requested = true;
-        } else if (c == 'E') {
-            led_trace_until = System::GetNow() + 15000;
-        } else if (c == 'C') {
-            calib_requested = true;
-        } else if (c == 'Q') {
-            qspi_probe_requested = true;
-        } else if (c == 'T' || c == 'F' || c == 'A' || c == 'M' || c == 'D' || c == 'U' || c == 'I' || c == 'X' || c == 'Y') {
-            usb_cmd_len = 0;
+            usb_line_ok = true;
+            continue;
+        }
+        if (!usb_line_ok)
+            continue;  // Not a command line: ignore the rest of it
+        bool fits = false;
+        if (usb_cmd_len == 0)
+            fits = strchr("BbKSNRZLECQTFAMDUIXY", c) != nullptr;
+        else if (usb_cmd[0] == 'M')
+            fits = HexDigit(c) >= 0;
+        else if (strchr("TFAMDUIXY", usb_cmd[0]))
+            fits = c >= '0' && c <= '9';
+        if (fits && usb_cmd_len < sizeof(usb_cmd) - 1) {
             usb_cmd[usb_cmd_len++] = c;
-        } else if (usb_cmd_len > 0 && c >= '0' && c <= '9' && usb_cmd_len < sizeof(usb_cmd) - 1) {
-            usb_cmd[usb_cmd_len++] = c;
-        } else if (usb_cmd_len > 0 && (c == '\n' || c == '\r')) {
-            usb_cmd[usb_cmd_len] = 0;
-            RunUsbCommand(usb_cmd[0], atoi(&usb_cmd[1]));
+        } else {
             usb_cmd_len = 0;
+            usb_line_ok = false;
         }
     }
 }
