@@ -1098,11 +1098,6 @@ void MonitorAndLog()
         Log("MIDI bytes dropped (%lu so far)", midi_dropped);
     if (save_failures != last_failures)
         Log("saving settings FAILED (%lu so far)", save_failures);
-    static bool pin_seen;
-    if (!pin_seen && midi_pin_edges > 0) {
-        Log("MIDI pin 37: activity (signal reaches the Seed)");
-        pin_seen = true;
-    }
     static bool jack_seen;
     if (!jack_seen && uart_bytes > 0) {
         Log("MIDI jack: receiving (first byte 0x%02x)", uart_first_byte);
@@ -1127,12 +1122,13 @@ void MonitorAndLog()
             tracks[1].HasLoop() ? t2 : "");
         (void)ms_tick;
         static uint32_t last_jack_bytes, last_jack_ticks, last_pin_edges;
-        if (uart_bytes != last_jack_bytes || midi_pin_edges != last_pin_edges)  // Only minutes with activity
+        if (uart_bytes != last_jack_bytes)  // Only minutes with MIDI (pin 37 floats on a bare Seed)
             Log("1m: MIDI pin edges %lu, jack %lu bytes, clocks %lu, UART errors %lu", midi_pin_edges - last_pin_edges,
                 uart_bytes - last_jack_bytes, midi_ticks - last_jack_ticks, uart_restarts);
         last_pin_edges = midi_pin_edges;
-        Log("1m: EXP pedal min %d%% max %d%% now %d%%", (int)(pedal_min * 100.0f), (int)(pedal_max * 100.0f),
-            (int)(pedal_now * 100.0f));
+        if (pedal_max - pedal_min > 0.03f)  // Only minutes the pedal moved
+            Log("1m: EXP pedal min %d%% max %d%% now %d%%", (int)(pedal_min * 100.0f), (int)(pedal_max * 100.0f),
+                (int)(pedal_now * 100.0f));
         pedal_min = 1.0f;
         pedal_max = 0.0f;
         last_jack_bytes = uart_bytes;
@@ -1349,8 +1345,6 @@ int main(void)
         lat_x100 % 100, roundtrip_latency > 0.0f ? "" : " (not calibrated)");
     if (fs1_held_at_boot)
         Log("calibration: footswitch 1 held at power-up, measuring (cable Out L -> In L)");
-    if (!(GPIOB->IDR & GPIO_IDR_ID15))
-        Log("MIDI pin 37 reads low at idle (should be high): opto or wiring?");
 
     while (1)
     {
