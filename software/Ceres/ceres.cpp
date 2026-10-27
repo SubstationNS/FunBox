@@ -233,6 +233,8 @@ volatile uint8_t  uart_first_byte;
 // byte starts with one). Tells "nothing reaches the Seed" apart from "the UART doesn't decode it".
 uint32_t          midi_pin_edges;
 bool              midi_pin_level = true;
+// Expression input, raw (0..1), for checking the jack: range over the current minute
+volatile float    pedal_now, pedal_min = 1.0f, pedal_max = 0.0f;
 
 
 // Whole BPM with hysteresis, so pot noise can't wobble the tempo
@@ -751,6 +753,9 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     // Knobs 1, 3, 4, 6, 5 and the pedal into the parameters (pickup, morph)
     float raw[ceres::Controls::kCount];
     float pedal = hw.GetExpression();
+    pedal_now   = pedal;
+    pedal_min   = fminf(pedal_min, pedal);
+    pedal_max   = fmaxf(pedal_max, pedal);
     raw[ceres::Controls::T1_LEVEL]  = level_knob[0].Process();
     raw[ceres::Controls::T2_LEVEL]  = level_knob[1].Process();
     raw[ceres::Controls::T1_FILTER] = filter_knob[0].Process();
@@ -943,8 +948,8 @@ void PrintStatus()
                       (int)(cpu_meter.GetAvgCpuLoad() * 100.0f), (int)(cpu_meter.GetMaxCpuLoad() * 100.0f),
                       midi_ticks, midi_starts, midi_continues, midi_stops, midi_spp, midi_cc, midi_other,
                       midi_dropped, uart_restarts);
-    hw.seed.PrintLine("  midi pin 37 %s, edges %lu, jack bytes %lu", midi_pin_level ? "high" : "LOW", midi_pin_edges,
-                      uart_bytes);
+    hw.seed.PrintLine("  midi pin 37 %s, edges %lu, jack bytes %lu  EXP pedal %d%%", midi_pin_level ? "high" : "LOW",
+                      midi_pin_edges, uart_bytes, (int)(pedal_now * 100.0f));
     minute_cpu_peak = fmaxf(minute_cpu_peak, cpu_meter.GetMaxCpuLoad());
     minute_cpu_sum += cpu_meter.GetAvgCpuLoad();
     minute_cpu_count++;
@@ -1126,6 +1131,10 @@ void MonitorAndLog()
             Log("1m: MIDI pin edges %lu, jack %lu bytes, clocks %lu, UART errors %lu", midi_pin_edges - last_pin_edges,
                 uart_bytes - last_jack_bytes, midi_ticks - last_jack_ticks, uart_restarts);
         last_pin_edges = midi_pin_edges;
+        Log("1m: EXP pedal min %d%% max %d%% now %d%%", (int)(pedal_min * 100.0f), (int)(pedal_max * 100.0f),
+            (int)(pedal_now * 100.0f));
+        pedal_min = 1.0f;
+        pedal_max = 0.0f;
         last_jack_bytes = uart_bytes;
         last_jack_ticks = midi_ticks;
         minute_err_peak_ms = 0.0f;
