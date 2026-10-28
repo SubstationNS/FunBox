@@ -28,6 +28,7 @@
 //   Knob 5: FX amount on the loops, 3-way 2: Tape / Delay / Repeat.
 //   3-way 1: grid for double-tap endings (1/4, 1/8, 1/16). 3-way 3: stop mode (now, end of bar, end of loop).
 //   DIP 1: split (In L / Out L = Track 1, In R / Out R = Track 2). DIP 2: power-of-two loop lengths.
+//   DIP 3: practice click on the beat (accent on bar 1), on both outputs, never recorded.
 //   DIP 4: expression learn (on = state A, off = state B: the pedal morphs what differs).
 //   Knobs and the pedal use pickup; MIDI CC (map in the README) jumps. The settings are saved to
 //   QSPI 10 s after the last change and restored at power-up.
@@ -713,6 +714,11 @@ void CalibrationAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out
 }
 
 
+// Practice click (DIP 3)
+static const float kClickLevel = 0.25f;    // -12 dBFS peak
+static const float kClickDecay = 0.9974f;  // ~8 ms time constant at 48 kHz
+float              click_env, click_phase, click_inc;
+
 static void AudioCallback(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           size_t                    size)
@@ -799,6 +805,9 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         tracks[t].BeginBlock(clock, st, midi_sync.Playing());
     }
 
+    // DIP 3: practice click, a short sine blip on each beat (higher on the bar), while the transport plays
+    bool click_on = hw.switches[Funbox::SWITCH_DIP_3].Pressed() && midi_sync.Playing();
+
     int channels = split_mode ? 2 : 1;  // Not split: one mix, on both outputs
     for (size_t i = 0; i < size; i++) {
         uint8_t events = clock.Process();
@@ -812,6 +821,19 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
             track_count = 0;
         }
         uint32_t tick = clock.Tick();
+
+        if (click_on && (events & Clock::BEAT)) {
+            click_env   = 1.0f;
+            click_phase = 0.0f;
+            click_inc   = ((events & Clock::BAR) ? 1600.0f : 1000.0f) / clock_sample_rate;
+        }
+        float click = 0.0f;
+        if (click_env > 0.0005f) {
+            click_phase += click_inc;
+            click_phase -= click_phase >= 1.0f ? 1.0f : 0.0f;
+            click = kClickLevel * click_env * sinf(2.0f * 3.14159265f * click_phase);
+            click_env *= kClickDecay;
+        }
 
         float dry[2] = {in[0][i], in[1][i]};
         if (test_tone) {
@@ -848,7 +870,7 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
             } else {
                 x = repeat[ch].Process(x, amount, events, tick);
             }
-            out[ch][i] = limiters[ch].Process(dry[ch] + x);
+            out[ch][i] = limiters[ch].Process(dry[ch] + x + click);
         }
         if (!split_mode)
             out[1][i] = out[0][i];

@@ -47,6 +47,7 @@ register locked while WP# is low), so every erase failed, including the Daisy bo
 | 3-way 3 | Stop mode: now / end of bar / end of loop |
 | DIP 1 | Split: In L → Track 1 → Out L, In R → Track 2 → Out R. Off: In L feeds both, both outs the same |
 | DIP 2 | Loop lengths round up to 1, 2, 4, 8, 16 ... bars |
+| DIP 3 | Practice click: a blip on every beat, higher on bar 1, on both outputs (never recorded). Follows MIDI clock, or knob 2 without it |
 | DIP 4 | Expression learn: on = state A, off = state B (see below) |
 | Expression | Morphs between state A and B |
 | MIDI in | Clock sets tempo and phase; Start = bar 1, Stop / Song Position / Continue like a DAW |
