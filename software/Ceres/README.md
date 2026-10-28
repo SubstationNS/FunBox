@@ -78,15 +78,15 @@ Per footswitch:
 
 - Settings are saved 10 s after the last change and come back at power-up (levels, filters, FX
   amount, tempo, the values set by MIDI CC, the expression morph). Loops aren't saved.
-- After power-up a knob does nothing until you turn it, and then only takes over once it passes
-  the saved value (pickup, the LED flashes when it does). The toggles and DIPs always apply as set.
+- After power-up the saved values hold until you turn a knob; then that knob takes over straight
+  away (the LED flashes, the change is smoothed so it doesn't click). The toggles and DIPs always apply as set.
 - Expression morph: set the sound you want at one end and put the pedal there, **DIP 4 on**
   (A, both LEDs flash, then breathe), move the knobs and the pedal to the other end's sound,
   **DIP 4 off** (B, both LEDs flash). Whatever differs between A and B now follows the pedal, any
   part of its travel. Knob 2 (tempo) is never part of it. DIP 4 on and off with no change in
   between clears the morph.
-- A knob and the pedal share the parameters they both control by pickup: whichever crosses the
-  current value last owns it, so nothing ever jumps.
+- A knob and the pedal share the parameters they both control: turning the knob takes over at
+  once; the pedal takes over when it crosses the current value (pickup), so it never jumps.
 
 ### Latency calibration (once, with a cable)
 

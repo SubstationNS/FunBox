@@ -90,9 +90,9 @@ p.send("N\nT120\n")  # Pin again: knob 1 reads 71 %, restored 30 %
 time.sleep(0.3)
 show("pinned at 71 %: still the restored 30 %", p.params())
 p.turn(0, 71, 50)
-show("knob 1 to 50 %: not crossed 30 yet", p.params())
+show("knob 1 to 50 %: moved, took over (50)", p.params())
 p.turn(0, 50, 20)
-show("knob 1 to 20 %: crossed 30, took over", p.params())
+show("knob 1 to 20 %: follows (20)", p.params())
 
 print("morph: DIP 4 on (A), T2 level 71 -> 0 and pedal 0 -> 90, DIP 4 off (B)", flush=True)
 p.send("Y1\n")

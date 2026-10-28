@@ -101,17 +101,13 @@ static void TestRestoreAndPickup()
     }
     CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.7f), "noise doesn't take over: %.3f", p.c.Value(Controls::T1_LEVEL));
 
-    // Moved, but away from the value: still the restored value
-    p.Turn(Controls::T1_LEVEL, 0.05f);
-    CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.7f) && p.c.GetOwner(Controls::T1_LEVEL) == Controls::NONE,
-          "moving away doesn't take over");
-    // Toward it, past it: takes over at the crossing, then follows
+    // Really moved, even away from the value: the knob takes over at once and follows
     p.events = 0;
-    p.Turn(Controls::T1_LEVEL, 0.65f);
-    CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.7f), "not there yet: %.3f", p.c.Value(Controls::T1_LEVEL));
+    p.Turn(Controls::T1_LEVEL, 0.05f);
+    CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.05f) && p.c.GetOwner(Controls::T1_LEVEL) == Controls::KNOB,
+          "moved: knob owns it: %.3f", p.c.Value(Controls::T1_LEVEL));
     p.Turn(Controls::T1_LEVEL, 0.8f);
-    CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.8f) && p.c.GetOwner(Controls::T1_LEVEL) == Controls::KNOB,
-          "crossed: knob owns it: %.3f", p.c.Value(Controls::T1_LEVEL));
+    CHECK(Near(p.c.Value(Controls::T1_LEVEL), 0.8f), "and follows: %.3f", p.c.Value(Controls::T1_LEVEL));
     CHECK(p.events & Controls::TAKEOVER_T1, "takeover reported (LED flash)");
     // Others untouched
     CHECK(Near(p.c.Value(Controls::FX_AMOUNT), 0.3f), "other parameters keep their values");
@@ -144,10 +140,10 @@ static void TestCc()
     p.c.Cc(Controls::T2_FILTER, 0.9f);
     p.Step(5);
     CHECK(Near(p.c.Value(Controls::T2_FILTER), 0.9f), "CC jumps: %.3f", p.c.Value(Controls::T2_FILTER));
+    p.Step(50);
+    CHECK(Near(p.c.Value(Controls::T2_FILTER), 0.9f), "a knob that doesn't move doesn't steal it");
     p.Turn(Controls::T2_FILTER, 0.6f);
-    CHECK(Near(p.c.Value(Controls::T2_FILTER), 0.9f), "knob below doesn't steal it");
-    p.Turn(Controls::T2_FILTER, 0.95f);
-    CHECK(Near(p.c.Value(Controls::T2_FILTER), 0.95f), "knob takes it back after crossing");
+    CHECK(Near(p.c.Value(Controls::T2_FILTER), 0.6f), "turning the knob takes it back: %.3f", p.c.Value(Controls::T2_FILTER));
 }
 
 static void TestMorph()

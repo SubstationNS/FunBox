@@ -6,12 +6,13 @@
 // Ceres parameters with several sources each (knob, expression pedal, MIDI CC), and the A/B
 // expression morph. Design: docs/looper-design.md, "Expression" and "State persistence".
 //
-//   - Pickup (DeepMind-style): a knob or the pedal is ignored until it has moved past a small
-//     threshold (pot noise, an unplugged jack, a curious kid's finger on a knob that doesn't move it
-//     far don't count). After that it takes over a parameter once it crosses the parameter's
-//     current value, never with a jump. The source that crossed last owns the parameter; the one
-//     that lost it has to move again (past the threshold) before it can take it back, so a knob
-//     resting where the pedal passes by doesn't grab it.
+//   - A knob or the pedal is ignored until it has moved past a small threshold (pot noise, an
+//     unplugged jack, a brush that doesn't really move it don't count). After that a knob takes
+//     over at once (the audio side smooths the jump): you turn it, it does something. The pedal
+//     takes over a parameter only once it crosses the current value (pickup), so it never jumps.
+//     The source that took over last owns the parameter; the one that lost it has to move again
+//     (past the threshold) before it can take it back, so a knob resting where the pedal passes
+//     by doesn't grab it.
 //   - MIDI CC jumps straight to its value: a CC is a deliberate value (and DAW automation would
 //     feel dead with pickup).
 //   - Morph: DIP 4 on captures state A (the morphable values + pedal position), DIP 4 off captures
@@ -132,7 +133,7 @@ class Controls
                 p.knob_prev  = p.knob_ref;
             }
             if (p.knob_armed) {
-                if (p.owner != KNOB && Crossed(p.knob_prev, knobs[i], p.value)) {
+                if (p.owner != KNOB) {  // Moved: takes over straight away
                     TakeOver(i, KNOB, knobs, pedal);
                     took = true;
                 }

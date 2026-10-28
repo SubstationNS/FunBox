@@ -30,7 +30,7 @@
 //   DIP 1: split (In L / Out L = Track 1, In R / Out R = Track 2). DIP 2: power-of-two loop lengths.
 //   DIP 3: practice click on the beat (accent on bar 1), on both outputs, never recorded.
 //   DIP 4: expression learn (on = state A, off = state B: the pedal morphs what differs).
-//   Knobs and the pedal use pickup; MIDI CC (map in the README) jumps. The settings are saved to
+//   Knobs take over when turned, the pedal by pickup; MIDI CC (map in the README) jumps. The settings are saved to
 //   QSPI 10 s after the last change and restored at power-up.
 //   Hold footswitch 1 while powering up: latency calibration (cable from Out L to In L).
 //   A black-box log in QSPI records boots, track / MIDI events and a summary every minute
@@ -1077,6 +1077,17 @@ void MonitorAndLog()
     if (now - last_check < 20)
         return;
     last_check = now;
+
+    // DIP switches: logged at power-up and whenever one changes
+    static int last_dips = -1;
+    int dips = 0;
+    for (int d = 0; d < 4; d++)
+        dips |= hw.switches[Funbox::SWITCH_DIP_1 + d].Pressed() ? 1 << d : 0;
+    if (dips != last_dips) {
+        Log("DIPs: 1 split %s, 2 power of two %s, 3 click %s, 4 learn %s", dips & 1 ? "ON" : "off",
+            dips & 2 ? "ON" : "off", dips & 4 ? "ON" : "off", dips & 8 ? "ON" : "off");
+        last_dips = dips;
+    }
 
     for (int t = 0; t < 2; t++) {
         ceres::Track::State st = tracks[t].GetState();
