@@ -65,7 +65,6 @@ static const float kTrueSampleRate48k = 16000000.0f / 6.0f * 295.0f / 16.0f / 10
 static const float kTempoPickupBpm = 3.0f;
 
 // LED flash lengths, in clock ticks (24 per beat), so they scale with tempo
-static const uint32_t kBeatFlashTicks = 3;
 static const uint32_t kBarFlashTicks  = 6;
 
 // Loop FX, one per output channel. Buffers live in SDRAM.
@@ -627,42 +626,23 @@ void HandleTransport()
 }
 
 
-// Recording: bright with a dip on every beat. Once its end is set (tap / power of two / preset
-// length) it counts down: in the last bar a dip on every beat (4-3-2-1); before that, at each bar
-// line, one short dip per bar still to go (up to 8).
-float RecordingLed(const ceres::Track& t, bool beat_flash)
-{
-    uint32_t end = t.EndTicks(), now = t.RecordedTicks();
-    if (end == 0 || end <= now)
-        return beat_flash ? 0.4f : 1.0f;
-    uint32_t left = (end - now + Clock::kTicksPerBar - 1) / Clock::kTicksPerBar;  // Bars to go, this one included
-    if (left <= 1)
-        return now % Clock::kTicksPerBeat < 6 ? 0.0f : 1.0f;  // Last bar: dark 1/16 on every beat
-    uint32_t in_bar = now % Clock::kTicksPerBar;
-    uint32_t dips   = left - 1 > 8 ? 8 : left - 1;  // Bars after this one
-    if (in_bar < dips * 12)
-        return in_bar % 12 < 6 ? 0.0f : 1.0f;  // 1/16 dark, 1/16 bright, per bar to go
-    return 1.0f;
-}
-
-
-// LED for a track: record = bright, overdub = fast blink, play = dim, armed = blink on the beat,
-// stop pending = blink dim; a dip on every beat (longer on bar 1). Empty: a faint beat flash.
+// LED for a track, one look per state (blocks run at 1 kHz):
+//   waiting for a bar line (armed, ending, stopping) = fast blink, recording = solid bright,
+//   overdub = slow blink, playing = dim with a short flash on bar 1, stopped = faint, empty = off.
 float TrackLed(const ceres::Track& t, uint32_t blocks)
 {
-    uint32_t tick       = clock.TickInBeat();
-    bool     bar_one    = clock.BeatInBar() == 0;
-    bool     beat_flash = tick < (bar_one ? kBarFlashTicks : kBeatFlashTicks);
+    bool fast = (blocks / 100) & 1, slow = (blocks / 400) & 1;
+    bool bar_flash = clock.BeatInBar() == 0 && clock.TickInBeat() < kBarFlashTicks;
     switch (t.GetState()) {
-        case ceres::Track::EMPTY: return beat_flash ? (bar_one ? 0.3f : 0.1f) : 0.0f;
+        case ceres::Track::EMPTY: return 0.0f;
         case ceres::Track::ARMED:
-        case ceres::Track::ARMED_PLAY: return tick < Clock::kTicksPerBeat / 2 ? 1.0f : 0.0f;
-        case ceres::Track::RECORDING: return RecordingLed(t, beat_flash);
-        case ceres::Track::OVERDUBBING: return (blocks / 60) & 1 ? 1.0f : 0.2f;
+        case ceres::Track::ARMED_PLAY: return fast ? 1.0f : 0.0f;
+        case ceres::Track::RECORDING: return t.EndTicks() != 0 ? (fast ? 1.0f : 0.0f) : 1.0f;
+        case ceres::Track::OVERDUBBING: return slow ? 1.0f : 0.2f;
         case ceres::Track::PLAYING:
             if (t.StopPending())
-                return tick < Clock::kTicksPerBeat / 2 ? 0.35f : 0.0f;
-            return beat_flash ? (bar_one ? 0.0f : 0.1f) : 0.35f;
+                return fast ? 0.35f : 0.0f;
+            return bar_flash ? 1.0f : 0.3f;
         default: return 0.04f;  // Stopped
     }
 }

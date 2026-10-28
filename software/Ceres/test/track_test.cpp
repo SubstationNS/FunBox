@@ -239,11 +239,13 @@ static void TestEndings()
     std::printf("track: endings\n");
     struct Case { const char* name; double tap_bar; bool pow2; uint32_t expect_ticks; };
     const Case cases[] = {
-        {"tap mid bar 3", 3.5, false, 3 * 96},          // Recording from bar 2: ends at bar 5 = 3 bars
-        {"tap 40 ms late (snaps back)", 3.02, false, 2 * 96},
-        {"tap 150 ms late", 3.075, false, 3 * 96},
-        {"pow2: tap in bar 3 of the loop", 3.5, true, 4 * 96},
-        {"pow2: tap in bar 5 of the loop", 5.5, true, 8 * 96},
+        {"tap early, late in bar 2", 2.7, false, 2 * 96},   // tap_bar - 1 = bars recorded at the tap
+        {"tap 40 ms late (trims back)", 3.02, false, 2 * 96},
+        {"tap 150 ms late (trims back)", 3.075, false, 2 * 96},
+        {"tap 0.45 bar late (trims back)", 3.45, false, 2 * 96},
+        {"tap 0.6 into bar 3 (records on)", 3.6, false, 3 * 96},
+        {"pow2: tap late in bar 3", 3.7, true, 4 * 96},
+        {"pow2: tap late in bar 5", 5.7, true, 8 * 96},
         {"pow2: tap just after 4 bars", 5.02, true, 4 * 96},
     };
     for (const Case& c : cases) {
@@ -257,6 +259,34 @@ static void TestEndings()
                     r.track.LengthTicks() % 96 ? " (+ part)" : "");
     }
 
+    // Late tap, trimmed back after the double-tap window: plays what was recorded, on the bar lines
+    {
+        Rig r;
+        r.Record(SineA, 3.3);  // 2.3 bars recorded at the tap -> 2 bars
+        CHECK(r.track.GetState() == Track::RECORDING, "late tap waits for a double tap first");
+        r.Run(0.6);
+        CHECK(r.track.GetState() == Track::PLAYING && r.track.LengthTicks() == 2 * 96, "then trims back: %u ticks",
+              r.track.LengthTicks());
+        r.input       = [](double) { return 0.0; };
+        uint64_t from = r.n + 1000;
+        r.Run(8.0);
+        double sum = 0.0, off = 0.0;
+        uint64_t cnt = 0;
+        for (uint64_t i = from; i < r.n; i++) {
+            if (r.pos[i] >= 300) {
+                double e = r.out[i] - r.LoopA(r.pos[i]);
+                sum += e * e;
+                cnt++;
+            }
+            if (r.pos[i] < r.pos[i - 1]) {
+                double bar = (double)i / r.SamplesPerBar();
+                off        = std::fmax(off, std::fabs(bar - std::round(bar)) * r.SamplesPerBar());
+            }
+        }
+        double err = std::sqrt(sum / cnt);
+        CHECK(err < 1e-3 && off < 2.0, "trimmed loop: rms error %.5f, wraps %.2f samples off the bar lines", err, off);
+        std::printf("  late tap, trimmed back                -> error %.5f, %.2f samples off the bar lines\n", err, off);
+    }
     // Double tap: end on the next 1/8 instead
     {
         Rig r;

@@ -9,8 +9,10 @@
 // Ceres loop track: quantized record / play / overdub / stop, undo / redo, clear.
 // Design: docs/looper-design.md, "Recording and playback" and "Track behaviour".
 //
-//   - Recording starts on a bar line and ends on a bar line (tap), a power-of-two bar count
-//     (DIP 2) or a grid step (double tap). A tap just after a boundary ends the loop on it.
+//   - Recording starts on a bar line and ends on the bar line nearest the tap (tap early: it
+//     records on to it; tap late: it's trimmed back to it), a power-of-two bar count (DIP 2) or
+//     the nearest grid step (double tap). A late tap is only applied once the double-tap window
+//     has passed, so a double tap can still choose the grid instead.
 //   - Length is kept in clock ticks and samples. Playback follows the clock: the position is
 //     pulled toward where the clock says the loop should be (rate nudges up to +-0.2 %, a
 //     crossfaded jump if it's far off), so loops stay locked to MIDI clock for hours. If the
@@ -68,7 +70,7 @@ class Track
     };
 
     static constexpr float  kFadeSeconds   = 0.005f;  // Seams, start/stop, punch in/out
-    static constexpr float  kSnapSeconds   = 0.08f;   // A tap this soon after a boundary ends the loop on it
+    static constexpr float  kTrimWaitSeconds = 0.45f;  // A late tap waits this long for a double tap (footswitch: 0.4 s)
     static constexpr float  kCancelSeconds = 1.2f;    // An overdub can be cancelled for this long
     static constexpr double kFollowRange   = 0.006;   // Tempo within 0.6 % of the recorded one: follow the clock
     static constexpr double kFollowSeconds = 0.25;    // Phase errors are pulled in over about this time
@@ -112,7 +114,7 @@ class Track
             case ARMED: state_ = EMPTY; break;
             case RECORDING:
                 if (end_ticks_ == 0) {
-                    EndRecording(kTicksPerBar, settings_.power_of_two, clock);
+                    EndRecording(kTicksPerBar, settings_.power_of_two, true, clock);
                     press_ended_recording_ = true;
                 }
                 break;
@@ -137,7 +139,7 @@ class Track
     void DoubleTap(const Clock& clock)
     {
         switch (state_) {
-            case RECORDING: EndRecording(settings_.grid_ticks, false, clock); break;  // End on the grid instead
+            case RECORDING: EndRecording(settings_.grid_ticks, false, false, clock); break;  // End on the grid instead
             case OVERDUBBING:
                 if (press_started_session_)
                     CancelSession();  // The first tap only started this
@@ -193,8 +195,10 @@ class Track
             state_ = STOPPED;
         else if (before_press_ == ARMED_PLAY && state_ == STOPPED)
             state_ = ARMED_PLAY;
-        else if (before_press_ == RECORDING && state_ == RECORDING)
-            end_ticks_ = 0;
+        else if (before_press_ == RECORDING && state_ == RECORDING) {
+            end_ticks_    = 0;
+            trim_pending_ = false;
+        }
         before_press_          = state_;
         press_started_session_ = false;
     }
@@ -202,6 +206,7 @@ class Track
     void Clear()
     {
         state_          = EMPTY;
+        trim_pending_   = false;
         cur_            = 0;
         len_            = 0;
         len_ticks_      = 0;
@@ -388,10 +393,13 @@ class Track
                     StartRecording(clock);
                 break;
             case RECORDING:
-                if (tick && rec_count_ > 0) {
+                if (tick && rec_count_ > 0)
                     rec_ticks_++;
-                    if (end_ticks_ != 0 && rec_ticks_ >= end_ticks_)
-                        Finish(rec_count_, end_ticks_);
+                if (trim_pending_) {  // Late tap: no double tap came, trim back to the bar line
+                    if (rec_count_ >= trim_deadline_)
+                        Finish(trim_samples_, end_ticks_);
+                } else if (tick && rec_count_ > 0 && end_ticks_ != 0 && rec_ticks_ >= end_ticks_) {
+                    Finish(rec_count_, end_ticks_);
                 }
                 break;
             case ARMED_PLAY:
@@ -585,6 +593,7 @@ class Track
     void StartRecording(const Clock& clock)
     {
         state_     = RECORDING;
+        trim_pending_   = false;
         cur_       = 0;
         rec_count_ = 0;
         rec_written_ = 0;
@@ -599,17 +608,18 @@ class Track
         job_       = NONE;
     }
 
-    // End on the boundary of `step` ticks that's coming (or the one just passed, if the tap was
-    // only a moment late). Power of two: round the bar count up.
-    void EndRecording(uint32_t step, bool power_of_two, const Clock& clock)
+    // End on the nearest boundary of `step` ticks: the one coming (tap in the second half of a
+    // step) or the one just passed (first half: late, trimmed back). Power of two: round the bar
+    // count up. `wait`: a trim back waits out the double-tap window first.
+    void EndRecording(uint32_t step, bool power_of_two, bool wait, const Clock& clock)
     {
-        double   frac  = clock.Position() - std::floor(clock.Position());
-        double   pos   = (double)rec_ticks_ + frac;  // Ticks recorded so far
-        uint32_t prev  = (uint32_t)(pos / step) * step;
-        double   since = pos - prev;
-        double   spt   = clock.SamplesPerTick();
-        double   snap  = std::fmin(kSnapSeconds * sr_, 0.25 * step * spt);
-        uint32_t target = (prev > 0 && since * spt <= snap) ? prev : prev + step;
+        trim_pending_   = false;
+        double   frac   = clock.Position() - std::floor(clock.Position());
+        double   pos    = (double)rec_ticks_ + frac;  // Ticks recorded so far
+        uint32_t prev   = (uint32_t)(pos / step) * step;
+        double   since  = pos - prev;
+        double   spt    = clock.SamplesPerTick();
+        uint32_t target = (prev > 0 && since <= 0.5 * step) ? prev : prev + step;
         if (power_of_two) {
             uint32_t bars = (target + kTicksPerBar - 1) / kTicksPerBar, p2 = 1;
             while (p2 < bars)
@@ -617,8 +627,16 @@ class Track
             target = p2 * kTicksPerBar;
         }
         if ((double)target <= pos) {
-            uint32_t back = (uint32_t)std::lround((pos - target) * spt);
-            Finish(rec_count_ > back ? rec_count_ - back : rec_count_, target);
+            uint32_t back    = (uint32_t)std::lround((pos - target) * spt);
+            uint32_t samples = rec_count_ > back ? rec_count_ - back : rec_count_;
+            if (wait) {
+                trim_pending_  = true;
+                trim_samples_  = samples;
+                trim_deadline_ = rec_count_ + (uint32_t)(kTrimWaitSeconds * sr_);
+                end_ticks_     = target;
+            } else {
+                Finish(samples, target);
+            }
         } else {
             end_ticks_ = target;
         }
@@ -644,8 +662,9 @@ class Track
         len_            = samples;
         len_ticks_      = ticks;
         end_ticks_      = 0;
+        trim_pending_   = false;
         state_          = PLAYING;
-        p_              = (double)(rec_count_ - samples);  // Already this far into the next time around
+        p_              = std::fmod((double)(rec_count_ - samples), (double)samples);  // Already this far into the next time around
         rate_           = 1.0;
         follow_         = true;
         stretching_     = false;
@@ -983,6 +1002,8 @@ class Track
 
     // Recording
     uint32_t rec_count_, rec_ticks_, end_ticks_, post_roll_left_;
+    bool     trim_pending_ = false;               // Late tap: trimming back once the double-tap window passes
+    uint32_t trim_samples_ = 0, trim_deadline_ = 0;
     uint32_t rec_written_, rec_skip_;  // Samples in the buffer; input latency still to skip
 
     // Loop and playback

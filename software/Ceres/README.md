@@ -58,12 +58,13 @@ Per footswitch:
 | --- | --- | --- | --- | --- |
 | empty | arm: records from the next bar | | | |
 | armed | cancel | | discard | |
-| recording | end at the next bar line (DIP 2: power of two) | end at the next grid step | discard | clear |
+| recording | end on the nearest bar line (DIP 2: power of two) | end on the nearest grid step | discard | clear |
 | playing | overdub | stop (stop mode) | undo / redo | clear |
 | overdubbing | back to playing | take the overdub back, stop | take it back, undo / redo | clear |
 | stopped | play from the next bar | | undo / redo | clear |
 
-- A tap up to 80 ms after a bar line (or grid step) ends the loop on it: being a little late is fine.
+- Ending a recording snaps to the nearest bar line: tap a little early and it records on to it,
+  tap late (up to half a bar) and it's trimmed back to it. Tap near the line you mean.
 - Overdubs can be taken back for 1.2 s (double tap / hold), without losing the previous undo.
 - Dry always passes at unity; loops (and the FX) are added; a limiter catches hot stacks.
 - Loop memory: 75 s per track.
@@ -126,10 +127,9 @@ Afterwards, plug in USB and run `python3 test/log.py` (`--save file.txt` to keep
 Buttons (20-28) act when the value goes to 64 or more. CC values jump (no pickup): a CC is a
 deliberate value, and DAW automation has to apply right away.
 
-LEDs: recording = bright, overdub = fast blink, playing = dim with a dip on every beat (longer on
-bar 1), armed = blinks on the beat, stopping = dim blink, stopped = faint glow, empty = faint beat flash.
-- Recording with its end set (tap, power of two, MIDI preset length) counts down: at each bar line
-  one short dip per bar still to go after this one, and in the last bar a dip on every beat (4-3-2-1).
+LEDs: waiting for a bar line (armed, recording about to end, stopping) = fast blink, recording =
+solid bright, overdub = slow blink, playing = dim with a short flash on bar 1, stopped = faint,
+empty = off. DIP 3 (click) gives you the beat.
 - MIDI clock lost (the pedal runs on at its last tempo): both LEDs breathe slowly, over whatever they
   show, until the clock comes back or knob 2 takes the tempo.
 - A knob or the pedal taking over a parameter: a short flash. DIP 4 learn: both flash, then breathe.
