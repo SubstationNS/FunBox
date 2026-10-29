@@ -96,6 +96,12 @@ make program-dfu
 make program
 ```
 
+Or flash any built .bin, Flash or SRAM type, with one command (from the dev shell; it reads the .bin to see which kind it is):
+```
+software/flash_app.sh path/to/pluto.bin
+```
+For SRAM programs it writes the program to QSPI with Ceres' USB serial loader and then installs the Daisy bootloader, so the bootloader's own DFU mode (unreliable on some machines) isn't needed. Hold BOOT, tap RESET, release BOOT when it asks (a running Ceres goes to DFU by itself).
+
 To upload your firmware to SRAM (more memory available here for larger programs), see the [libdaisy Bootloader Reference](https://electro-smith.github.io/libDaisy/md_doc_2md_2__a7___getting-_started-_daisy-_bootloader.html#autotoc_md49)
 or use the [Electrosmith Web Programmer](https://electro-smith.github.io/Programmer/)
 
